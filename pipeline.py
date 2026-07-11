@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import base64
 import datetime
 import urllib.request
@@ -60,7 +61,32 @@ def process_ledger_photo_input(image_path: str, borrower_session_id: str) -> dic
     # 2. Construct timestamp
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     
-    # 3. Package payload matching schema.json
+# <<<<<<< Updated upstream
+#     # 3. Package payload matching schema.json
+# =======
+#     # 3. Package payload with image_data_base64, omitting raw_extracted_text
+# >>>>>>> Stashed changes
+#     payload = {
+#         "source_type": "ledger_photo",
+#         "daily_revenue_estimate": 0.0,            # Placeholder — will be read by Gemini vision
+#         "revenue_variance": "low",                # Placeholder
+#         "payment_consistency": "low",             # Placeholder
+#         "confidence_score": 0.0,                  # Placeholder
+#         "anomaly_flags": [],                      # Placeholder
+# <<<<<<< Updated upstream
+#         "raw_extracted_text": "",                 # Empty — text not available for photos
+#         "image_data_base64": base64_image,        # Base64 data URL for Gemini vision
+# =======
+#         "image_data_base64": base64_image,        # New field for base64 image data
+#         "raw_extracted_text": None,               # Explicitly set to None
+# >>>>>>> Stashed changes
+#         "timestamp": timestamp_str,
+#         "borrower_session_id": borrower_session_id,
+#         "route": "escalate",                      # Hardcoded cloud escalation
+#         "routing_reason": "ledger_photo: local vision unsupported"
+#     }
+    
+        # 3. Package payload matching schema.json
     payload = {
         "source_type": "ledger_photo",
         "daily_revenue_estimate": 0.0,            # Placeholder — will be read by Gemini vision
@@ -75,7 +101,6 @@ def process_ledger_photo_input(image_path: str, borrower_session_id: str) -> dic
         "route": "escalate",                      # Hardcoded cloud escalation
         "routing_reason": "ledger_photo: local vision unsupported"
     }
-    
     return payload
 
 def call_backend(payload: dict) -> dict:
@@ -93,6 +118,15 @@ def call_backend(payload: dict) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        print(f"\n[BACKEND HTTP ERROR] Backend returned status code {e.code}.")
+        try:
+            err_body = e.read().decode('utf-8')
+            print("Response JSON (Error Details):")
+            print(json.dumps(json.loads(err_body), indent=2))
+        except Exception:
+            pass
+        raise e
     except urllib.error.URLError as e:
         print("\n[CONNECTION ERROR] Could not connect to the FastAPI backend service.")
         print("Please ensure that you have started the backend API server first by running:")
@@ -148,17 +182,25 @@ if __name__ == "__main__":
         # Display the payload shape (truncate base64 data for readability)
         print("1. Ledger Pipeline Routing & Payload Output:")
         payload_copy = dict(ledger_payload)
-        payload_copy["raw_extracted_text"] = payload_copy["raw_extracted_text"][:80] + "... [TRUNCATED IMAGE BASE64] ..."
+        if payload_copy.get("image_data_base64"):
+            payload_copy["image_data_base64"] = payload_copy["image_data_base64"][:80] + "... [TRUNCATED IMAGE BASE64] ..."
         print(json.dumps(payload_copy, indent=2))
+        print("Local Gemma Latency: N/A (Skipped - Vision unsupported)")
         print("-" * 40)
         
         # Post payload to FastAPI backend
+        t_backend_start = time.perf_counter()
         backend_out = call_backend(ledger_payload)
+        backend_latency = time.perf_counter() - t_backend_start
         print("2. Backend Assessment Response (Stubs Escalation):")
         print(json.dumps(backend_out, indent=2))
+        print(f"Backend/ADK Latency: {backend_latency:.3f}s")
         
     except ConnectionError:
         print("Pipeline run aborted: Backend is offline.")
+        os._exit(1)
+    except urllib.error.HTTPError as e:
+        print(f"Pipeline run aborted: Backend returned validation error {e.code}.")
         os._exit(1)
     except Exception as e:
         print(f"Ledger pipeline verification failed: {e}")
@@ -177,14 +219,20 @@ if __name__ == "__main__":
             print(f"------------------------------------------")
             print(f"Input SMS:\n{sample.strip()}\n")
             try:
+                t_gemma_start = time.perf_counter()
                 pipeline_out = process_sms_input(sample, borrower_session_id=session_id)
+                gemma_latency = time.perf_counter() - t_gemma_start
                 print("1. Pipeline Extraction & Routing Output:")
                 print(json.dumps(pipeline_out, indent=2))
+                print(f"Local Gemma Latency: {gemma_latency:.3f}s")
                 print("-" * 40)
                 
+                t_backend_start = time.perf_counter()
                 backend_out = call_backend(pipeline_out)
+                backend_latency = time.perf_counter() - t_backend_start
                 print("2. Backend Credit Risk Assessment Output:")
                 print(json.dumps(backend_out, indent=2))
+                print(f"Backend/ADK Latency: {backend_latency:.3f}s")
             except ConnectionError:
                 break
             except Exception as e:
