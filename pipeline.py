@@ -103,6 +103,61 @@ def process_ledger_photo_input(image_path: str, borrower_session_id: str) -> dic
     }
     return payload
 
+
+def encode_audio_to_base64(audio_path: str) -> str:
+    """Reads a local audio file and returns a base64 Data URL string."""
+    ext = os.path.splitext(audio_path)[1].lower()
+    mime_map = {
+        ".wav":  "audio/wav",
+        ".mp3":  "audio/mpeg",
+        ".ogg":  "audio/ogg",
+        ".m4a":  "audio/mp4",
+        ".flac": "audio/flac",
+        ".webm": "audio/webm",
+    }
+    mime_type = mime_map.get(ext, "audio/wav")   # default to wav if unknown
+    with open(audio_path, "rb") as f:
+        encoded_string = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded_string}"
+
+
+def process_voice_note_input(audio_path: str, borrower_session_id: str) -> dict:
+    """
+    Handles voice note inputs. Since local Gemma lacks audio support,
+    it skips local extraction entirely, hardcodes escalation routing,
+    and base64-encodes the audio file.
+
+    Mirrors process_ledger_photo_input() exactly — same schema shape,
+    same escalation pattern, different modality field (audio_data_base64).
+    """
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Voice note not found at: {audio_path}")
+
+    # 1. Base64-encode the audio
+    base64_audio = encode_audio_to_base64(audio_path)
+
+    # 2. Construct timestamp
+    timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 3. Package payload matching schema.json
+    payload = {
+        "source_type": "voice_note",
+        "daily_revenue_estimate": 0.0,            # Placeholder — will be read by Gemini audio agent
+        "revenue_variance": "low",                # Placeholder
+        "payment_consistency": "low",             # Placeholder
+        "confidence_score": 0.0,                  # Placeholder
+        "anomaly_flags": [],                      # Placeholder
+        "raw_extracted_text": "",                 # Empty — transcription happens cloud-side
+        "audio_data_base64": base64_audio,        # Base64 data URL for Gemini audio agent
+        "timestamp": timestamp_str,
+        "borrower_session_id": borrower_session_id,
+        "route": "escalate",                      # Hardcoded cloud escalation
+        "routing_reason": "voice_note: local audio transcription unsupported",
+    }
+
+    return payload
+
+
 def call_backend(payload: dict) -> dict:
     """
     POSTs the pipeline payload to the FastAPI credit risk backend.
