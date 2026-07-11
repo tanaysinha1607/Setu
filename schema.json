@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BorrowerFinancialData",
+  "description": "Structured borrower financial data extracted from multimodal input (SMS text, ledger photo, voice note).",
+  "type": "object",
+  "properties": {
+    "source_type": {
+      "description": "The type of input source from which the financial data was extracted.",
+      "type": "string",
+      "enum": ["sms", "ledger_photo", "voice_note"]
+    },
+    "daily_revenue_estimate": {
+      "description": "Estimated daily revenue of the borrower in Indian Rupees (INR).",
+      "type": "number",
+      "minimum": 0
+    },
+    "revenue_variance": {
+      "description": "The level of variance or volatility in the borrower's daily revenue.",
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "payment_consistency": {
+      "description": "The level of consistency in the borrower's payment behavior.",
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "confidence_score": {
+      "description": "The model's self-reported confidence score for the extraction, ranging from 0 (lowest) to 1 (highest).",
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "anomaly_flags": {
+      "description": "A list of flagged anomalies detected in the data (e.g., 'revenue_spike', 'narrative_mismatch'). Empty if no anomalies are detected.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "raw_extracted_text": {
+      "description": "The raw text read/transcribed by the model from the source input, used for audit and debugging.",
+      "type": "string"
+    },
+    "timestamp": {
+      "description": "ISO 8601 formatted timestamp of when the extraction was performed.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "borrower_session_id": {
+      "description": "Identifier linking multiple extraction records (SMS, ledger, voice) to the same borrower assessment session.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "source_type",
+    "daily_revenue_estimate",
+    "revenue_variance",
+    "payment_consistency",
+    "confidence_score",
+    "anomaly_flags",
+    "raw_extracted_text",
+    "timestamp",
+    "borrower_session_id"
+  ]
+}

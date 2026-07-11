@@ -1,0 +1,18 @@
+# Ignore large model files
+*.gguf
+
+# Ignore zip archives
+*.zip
+
+# Ignore extracted third-party binaries
+llama-bin/
+
+# Ignore local caches
+.cache/
+
+# Ignore logs
+*.log
+
+# Ignore local debug/scratch scripts
+debug_sms.py
+debug_server.py
