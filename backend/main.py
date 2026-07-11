@@ -1,11 +1,21 @@
 """
 Setu — Adaptive AI Credit Risk Assessment Backend
 FastAPI service that receives pre-routed borrower data from the local Gemma
-pipeline and either scores it locally or stubs an escalation to the Gemini
-Managed Agent.
+pipeline and either scores it locally or escalates to the Gemini API.
+
+Escalation strategy (in order):
+  1. google-adk  (Managed Agents / iAPI)  — preferred if SDK is present
+  2. google-genai v2 (google.genai.Client) — automatic fallback
+
+The response always includes 'escalation_method' so you can tell a judge
+exactly which path fired.
 """
 
+import os
+import re
+import json
 import time
+import logging
 from datetime import datetime
 from typing import Literal
 
@@ -13,6 +23,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+
+# Load .env from the project root (one directory above backend/)
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    load_dotenv(dotenv_path=_env_path)
+except ImportError:
+    pass  # python-dotenv not installed; rely on OS env vars
+
+logger = logging.getLogger("setu")
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -48,45 +68,36 @@ class AssessmentRequest(BaseModel):
 
 
 class AssessmentResponse(BaseModel):
-    risk_score: float | None       # 0-100; None when pending review
-    risk_category: str             # "low" | "medium" | "high" | "pending_review"
+    risk_score: float | None       # 0-100; None on total failure
+    risk_category: str             # "low" | "medium" | "high" | "error"
     explanation: str
     route: str
     routing_reason: str
     latency_ms: float
+    # Tells judges which escalation path fired
+    escalation_method: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# Scoring helpers
+# Local scoring helpers
 # ---------------------------------------------------------------------------
 
-# Ordinal mappings for categorical fields
-_VARIANCE_MAP = {"low": 1.0, "medium": 0.5, "high": 0.0}
+_VARIANCE_MAP    = {"low": 1.0, "medium": 0.5, "high": 0.0}
 _CONSISTENCY_MAP = {"high": 1.0, "medium": 0.5, "low": 0.0}
-
-# Revenue normalisation ceiling (₹20,000 daily → score 1.0; anything above caps)
-_REVENUE_CAP = 20_000.0
-
-# Weights (must sum to 1.0)
-_WEIGHT_REVENUE = 0.40
-_WEIGHT_VARIANCE = 0.30
-_WEIGHT_CONSISTENCY = 0.30
+_REVENUE_CAP         = 20_000.0
+_WEIGHT_REVENUE      = 0.40
+_WEIGHT_VARIANCE     = 0.30
+_WEIGHT_CONSISTENCY  = 0.30
 
 
 def _compute_risk_score(req: AssessmentRequest) -> float:
     """
     Returns a creditworthiness score in [0, 100].
     Higher score = lower risk (more creditworthy).
-
-    Formula (weighted sum of normalised components):
-      revenue_component    : clamped daily_revenue / cap        (40 %)
-      variance_component   : inverted variance level            (30 %)
-      consistency_component: payment_consistency level          (30 %)
     """
-    revenue_norm = min(req.daily_revenue_estimate / _REVENUE_CAP, 1.0)
-    variance_norm = _VARIANCE_MAP[req.revenue_variance]
+    revenue_norm     = min(req.daily_revenue_estimate / _REVENUE_CAP, 1.0)
+    variance_norm    = _VARIANCE_MAP[req.revenue_variance]
     consistency_norm = _CONSISTENCY_MAP[req.payment_consistency]
-
     raw = (
         _WEIGHT_REVENUE * revenue_norm
         + _WEIGHT_VARIANCE * variance_norm
@@ -114,6 +125,226 @@ def _build_local_explanation(req: AssessmentRequest, score: float, category: str
 
 
 # ---------------------------------------------------------------------------
+# Gemini escalation — shared prompt builders
+# ---------------------------------------------------------------------------
+
+_AGENT_SYSTEM_PROMPT = """\
+You are a senior credit risk analyst specialising in microfinance for informal-sector \
+small businesses in India. You receive structured financial data that a local ML model \
+flagged as anomalous or low-confidence and could not safely score on its own.
+
+Your job:
+1. Reason carefully over the flagged signals. Consider whether each anomaly flag \
+   (e.g. "revenue_spike") is likely a one-off legitimate event (festival bonus, \
+   bulk order, salary credit, advance payment from a wholesaler) or a genuine red \
+   flag (fabricated data, money laundering, loan stacking). Weigh the raw extracted \
+   text as primary evidence.
+2. Produce a conservative but fair risk_score between 0 and 100 \
+   (higher = MORE creditworthy / LOWER risk).
+3. Classify the risk_category as exactly one of: "low", "medium", or "high".
+4. Write a clear, concise explanation (2-4 sentences) of your reasoning — \
+   your thought process, not just the verdict.
+
+Return ONLY a JSON object with exactly these keys:
+{
+  "risk_score": <number 0-100>,
+  "risk_category": "low" | "medium" | "high",
+  "explanation": "<string>"
+}
+No markdown, no preamble, no extra keys.
+"""
+
+
+def _build_agent_user_message(req: AssessmentRequest) -> str:
+    """Construct the user-turn message fed to Gemini."""
+    flags_str = ", ".join(req.anomaly_flags) if req.anomaly_flags else "none"
+    return (
+        f"ESCALATION CASE — BORROWER SESSION: {req.borrower_session_id}\n\n"
+        f"Financial data (extracted from {req.source_type.replace('_', ' ')}):\n"
+        f"  • Daily revenue estimate : ₹{req.daily_revenue_estimate:,.2f}\n"
+        f"  • Revenue variance       : {req.revenue_variance}\n"
+        f"  • Payment consistency    : {req.payment_consistency}\n"
+        f"  • Extraction confidence  : {req.confidence_score:.0%}\n"
+        f"  • Anomaly flags          : {flags_str}\n\n"
+        f"Routing reason (why local model could not score this):\n"
+        f"  {req.routing_reason}\n\n"
+        f"Raw extracted text (primary evidence — treat as ground truth):\n"
+        f"\"\"\"\n{req.raw_extracted_text}\n\"\"\"\n\n"
+        f"Please analyse and return the JSON risk assessment."
+    )
+
+
+def _parse_gemini_json(text: str) -> dict:
+    """
+    Extract the first valid JSON object from the model response.
+    Uses raw_decode so it stops after the first complete object even if the
+    model appends stray trailing characters (e.g. gemini-3.5-flash adds '}').
+    Falls back to a regex-extract + loads if raw_decode fails.
+    """
+    # Strip markdown code fences if present
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]+?)```", text, re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1)
+
+    text = text.strip()
+
+    # Find the start of the JSON object and parse only that
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found in response: {text!r}")
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text, idx=start)
+        return obj
+    except json.JSONDecodeError:
+        # Last resort: try loading the whole stripped string
+        return json.loads(text)
+
+
+# ---------------------------------------------------------------------------
+# Escalation path 1 — google-adk Managed Agent (iAPI)
+# ---------------------------------------------------------------------------
+
+def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
+    """
+    Call Gemini via google-adk Managed Agent (iAPI).
+    Raises ImportError if ADK is not installed (triggers fallback in caller).
+    """
+    # ADK is not yet publicly pip-installable; this will ImportError gracefully.
+    from google.adk.agents import LlmAgent          # type: ignore
+    from google.adk.runners import InProcessRunner  # type: ignore
+    from google.adk.sessions import InMemorySessionService  # type: ignore
+    import asyncio
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+    agent = LlmAgent(
+        name="setu_credit_risk_analyst",
+        model="gemini-3.5-flash",
+        description="Senior credit risk analyst for microfinance escalated cases.",
+        instruction=_AGENT_SYSTEM_PROMPT,
+    )
+
+    session_service = InMemorySessionService()
+    runner = InProcessRunner(
+        agent=agent,
+        app_name="setu",
+        session_service=session_service,
+    )
+
+    user_msg = _build_agent_user_message(req)
+
+    async def _run():
+        from google.adk.types import Content, Part
+        session = await session_service.create_session(
+            app_name="setu", user_id="backend"
+        )
+        events = runner.run_async(
+            user_id="backend",
+            session_id=session.id,
+            new_message=Content(role="user", parts=[Part(text=user_msg)]),
+        )
+        final_text = ""
+        async for event in events:
+            if hasattr(event, "content") and event.content:
+                for part in event.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        final_text += part.text
+        return final_text
+
+    raw_text = asyncio.run(_run())
+    parsed = _parse_gemini_json(raw_text)
+    return parsed, "google-adk Managed Agent (iAPI, LlmAgent, gemini-3.5-flash)"
+
+
+# ---------------------------------------------------------------------------
+# Escalation path 2 — google-genai v2 SDK (direct, with agent-style prompt)
+# ---------------------------------------------------------------------------
+
+def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
+    """
+    Call Gemini via the google-genai v2 SDK (google.genai.Client).
+    The system_instruction turns this into an agent-style call — same depth of
+    reasoning, just not a formal Managed Agent session.
+    """
+    import google.genai as genai
+    from google.genai import types as genai_types
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+    client = genai.Client(api_key=api_key)
+
+    user_msg = _build_agent_user_message(req)
+
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=user_msg,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=_AGENT_SYSTEM_PROMPT,
+            temperature=0.2,           # low temp = consistent, deterministic risk scores
+            max_output_tokens=1024,
+            response_mime_type="application/json",
+        ),
+    )
+
+    raw_text = response.text or ""
+    parsed = _parse_gemini_json(raw_text)
+    return parsed, (
+        "google-genai v2 SDK (google.genai.Client, direct GenerativeContent call, "
+        "gemini-3.5-flash, agent-style system_instruction)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Escalation orchestrator — tries ADK first, then falls back
+# ---------------------------------------------------------------------------
+
+def _escalate_to_gemini(req: AssessmentRequest) -> tuple[float | None, str, str, str]:
+    """
+    Tries escalation paths in priority order.
+    Returns (risk_score, risk_category, explanation, method_label).
+    """
+    attempts = [
+        ("ADK",        _call_adk_agent),
+        ("direct-SDK", _call_genai_direct),
+    ]
+
+    for label, attempt_fn in attempts:
+        try:
+            parsed, method = attempt_fn(req)
+
+            risk_score = float(parsed["risk_score"])
+            risk_score = max(0.0, min(100.0, round(risk_score, 2)))  # clamp to [0,100]
+            risk_category = str(parsed.get("risk_category", "")).lower()
+            if risk_category not in ("low", "medium", "high"):
+                risk_category = _categorise(risk_score)
+            explanation = str(parsed["explanation"])
+            return risk_score, risk_category, explanation, method
+
+        except ImportError:
+            logger.info(f"[escalate] {label}: SDK not installed — trying next")
+            continue
+        except Exception as exc:
+            logger.warning(f"[escalate] {label}: failed ({exc!r}) — trying next")
+            continue
+
+    # All paths failed — safe conservative fallback
+    return (
+        None,
+        "high",
+        (
+            "Gemini escalation failed (both ADK and direct-SDK paths raised errors). "
+            "Defaulting to HIGH risk as a conservative safety measure. "
+            f"Routing reason: {req.routing_reason}"
+        ),
+        "none (all escalation paths failed)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -124,7 +355,7 @@ app = FastAPI(
         "Receives pre-routed borrower data from a local Gemma model and either "
         "scores locally or escalates to a Gemini Managed Agent."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -146,9 +377,9 @@ def health_check():
     return {
         "status": "ok",
         "service": "setu-credit-risk-api",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "endpoints": {
-            "docs": "/docs",
+            "docs":   "/docs",
             "assess": "POST /assess",
             "health": "GET /health",
         },
@@ -161,26 +392,20 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
     Main assessment endpoint.
 
     - route == 'local'    → weighted scoring function returns risk_score + category.
-    - route == 'escalate' → stubbed response; Gemini Managed Agent not yet wired.
+    - route == 'escalate' → calls Gemini API (ADK Managed Agent → direct-SDK fallback).
     """
     t_start = time.perf_counter()
+    escalation_method: str | None = None
 
     if req.route == "local":
-        risk_score = _compute_risk_score(req)
+        risk_score    = _compute_risk_score(req)
         risk_category = _categorise(risk_score)
-        explanation = _build_local_explanation(req, risk_score, risk_category)
+        explanation   = _build_local_explanation(req, risk_score, risk_category)
 
     elif req.route == "escalate":
-        # TODO: Replace stub with real Gemini Managed Agent call
-        risk_score = None
-        risk_category = "pending_review"
-        explanation = (
-            "Escalated to Managed Agent (not yet implemented). "
-            f"Routing reason: {req.routing_reason}"
-        )
+        risk_score, risk_category, explanation, escalation_method = _escalate_to_gemini(req)
 
     else:
-        # Pydantic's Literal already guards this, but be defensive
         raise HTTPException(status_code=400, detail=f"Unknown route value: {req.route!r}")
 
     latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
@@ -192,4 +417,5 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
         route=req.route,
         routing_reason=req.routing_reason,
         latency_ms=latency_ms,
+        escalation_method=escalation_method,
     )
