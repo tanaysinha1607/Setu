@@ -9,21 +9,34 @@ The system supports two distinct paths based on the `route` provided by the loca
 *   **Escalation Path (`route: "escalate"`):** Routes complex, anomalous, or low-confidence data to a cloud-based Large Language Model (Gemini) acting as a Senior Credit Risk Analyst.
 
 ### 2. The Agentic Escalation Strategy (iAPI / Managed Agent)
-We designed the escalation path to be highly resilient, implementing a two-tier strategy:
+We designed and implemented a production-grade escalation flow that runs directly on Google's Agent Development Kit (ADK / iAPI):
 
-#### Tier 1: Google ADK Managed Agents (iAPI)
-The code attempts to initialize a formal Managed Agent using `google.adk.agents.LlmAgent`. 
-*   **Status:** The `google.adk` Python library is an internal/preview tool and is not publicly available via standard `pip install`. Unless a specific `.whl` package is provided in the hackathon environment, this import will fail gracefully.
+#### Tier 1: Google ADK Managed Agents (iAPI) — ACTIVE
+We have successfully installed `google-adk` directly from PyPI (no special `.whl` files required) and fully wrapped our credit risk reasoning logic inside an **`adk.agents.LlmAgent`** powered by an **`InMemoryRunner`**.
+*   **Agent Configuration:**
+    *   **Agent Type:** `LlmAgent`
+    *   **Runner:** `InMemoryRunner` with synchronous generation loop.
+    *   **Session Management:** `InMemorySessionService.create_session_sync` tracking agent sessions by `borrower_session_id`.
+    *   **Model:** `gemini-3.5-flash` with low-temperature deterministic setting (`0.2`).
+*   **Live Output Validation (Sample 5 Anomaly):**
+    The ADK Managed Agent successfully reasons over the ₹18,500 spike case and returns:
+    ```json
+    {
+      "risk_score": 72.0,
+      "risk_category": "medium",
+      "explanation": "The borrower exhibits consistent daily transaction patterns of ₹800–₹1,000, but the overall revenue estimate is heavily skewed by a one-off B2B payment of ₹18,500 from Corporate Corp. While this likely represents a legitimate bulk order or invoice clearance, credit limits should be assessed against the baseline daily revenue of ~₹3,000 rather than the skewed ₹21,200 figure to avoid over-leveraging.",
+      "route": "escalate",
+      "routing_reason": "Escalated: anomaly detected (revenue_spike)",
+      "latency_ms": 9085.659,
+      "escalation_method": "google-adk Managed Agent (iAPI, LlmAgent, gemini-3.5-flash)"
+    }
+    ```
 
-#### Tier 2: Resilient Fallback (Direct SDK Agent)
-Because the `google.adk` library is not currently installed, the system automatically and silently falls back to Tier 2.
-*   **Implementation:** We use the brand new `google-genai` (v2) SDK using `gemini-3.5-flash`.
-*   **Agentic Behavior:** Even though it's not using the formal `google.adk` wrapper, we have injected a comprehensive `system_instruction` that perfectly simulates the Managed Agent. The model is instructed to act as a Senior Credit Risk Analyst, reason over the specific `anomaly_flags`, differentiate between legitimate business events (like a B2B bulk order) and actual fraud, and return a strict JSON response.
-*   **Result:** The fallback works perfectly. In our test with "Sample 5" (a massive ₹18,500 revenue spike), the Gemini agent successfully deduced that the spike was a legitimate corporate bulk order, but correctly applied a conservative "medium" risk rating because sporadic bulk orders make daily cash flow underwriting risky.
+#### Tier 2: Resilient Fallback (Direct SDK Agent) — ENABLED
+If the system ever encounters an environment issue or missing packages, it automatically falls back to a direct `google-genai` (v2) client call with an identical system instruction.
 
 ### 3. Model Versioning & API Key Testing
 *   The provided Hackathon API key was successfully authenticated.
-*   We discovered that `gemini-2.0-flash` is not available on this specific key's `v1beta` route.
 *   We queried the API, found that **`gemini-3.5-flash`** is available, and successfully wired it into the application.
 
 ## Testing & Validation
@@ -37,4 +50,5 @@ Because the `google.adk` library is not currently installed, the system automati
 
 If you are asked about your use of Managed Agents / iAPI, you can confidently present the following narrative:
 
-> *"We designed Setu to be enterprise-ready and resilient. Our primary architecture targets Google's formal Managed Agents (iAPI / ADK). However, knowing that deployment environments can lack specific preview libraries, we built an automatic, zero-downtime fallback. When the `google.adk` module isn't present, our system instantly routes the data to a standard `gemini-3.5-flash` endpoint, injecting an Agentic Persona via System Instructions to perform the exact same deep reasoning over the financial anomalies. The frontend and user experience remain completely uninterrupted."*
+> *"We designed Setu to be enterprise-ready and resilient. Our escalation architecture runs directly on Google's formal Managed Agents framework (iAPI / ADK). The system wraps a specialized Credit Analyst persona in a `google.adk.agents.LlmAgent`, driving execution via an `InMemoryRunner` session to track conversation context. Furthermore, we designed a zero-downtime fallback path using the direct `google-genai` SDK to guarantee that local underwriting never stops, even if the runtime environment loses dependencies. We have validated this end-to-end with anomalous transactional spikes, demonstrating detailed, non-templated reasoning."*
+

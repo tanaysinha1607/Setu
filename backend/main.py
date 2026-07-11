@@ -209,15 +209,16 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
     Call Gemini via google-adk Managed Agent (iAPI).
     Raises ImportError if ADK is not installed (triggers fallback in caller).
     """
-    # ADK is not yet publicly pip-installable; this will ImportError gracefully.
-    from google.adk.agents import LlmAgent          # type: ignore
-    from google.adk.runners import InProcessRunner  # type: ignore
-    from google.adk.sessions import InMemorySessionService  # type: ignore
-    import asyncio
+    from google.adk.agents import LlmAgent
+    from google.adk.runners import InMemoryRunner
+    from google.genai.types import Content, Part
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set in environment")
+    
+    # Ensure ADK's internal client picks up the API key via the expected env var
+    os.environ["GOOGLE_API_KEY"] = api_key
 
     agent = LlmAgent(
         name="setu_credit_risk_analyst",
@@ -226,36 +227,30 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
         instruction=_AGENT_SYSTEM_PROMPT,
     )
 
-    session_service = InMemorySessionService()
-    runner = InProcessRunner(
-        agent=agent,
-        app_name="setu",
-        session_service=session_service,
+    runner = InMemoryRunner(agent=agent, app_name="setu")
+
+    # Use runner's own session service to create session synchronously
+    session = runner.session_service.create_session_sync(
+        app_name="setu", user_id="backend", session_id=req.borrower_session_id
     )
 
     user_msg = _build_agent_user_message(req)
 
-    async def _run():
-        from google.adk.types import Content, Part
-        session = await session_service.create_session(
-            app_name="setu", user_id="backend"
-        )
-        events = runner.run_async(
-            user_id="backend",
-            session_id=session.id,
-            new_message=Content(role="user", parts=[Part(text=user_msg)]),
-        )
-        final_text = ""
-        async for event in events:
-            if hasattr(event, "content") and event.content:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        final_text += part.text
-        return final_text
+    # Run generator synchronously to consume the response
+    final_text = ""
+    for event in runner.run(
+        user_id="backend",
+        session_id=session.id,
+        new_message=Content(role="user", parts=[Part(text=user_msg)]),
+    ):
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    final_text += part.text
 
-    raw_text = asyncio.run(_run())
-    parsed = _parse_gemini_json(raw_text)
+    parsed = _parse_gemini_json(final_text)
     return parsed, "google-adk Managed Agent (iAPI, LlmAgent, gemini-3.5-flash)"
+
 
 
 # ---------------------------------------------------------------------------
