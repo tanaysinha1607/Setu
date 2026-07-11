@@ -31,6 +31,8 @@ Setu/
 ├── google_gemma-4-E4B-it-Q4_K_M_v2.gguf
 ├── llama-cpu-x64.zip
 ├── llama_server.log
+├── routing_engine.py
+├── pipeline.py
 └── project_overview.md (this file)
 ```
 
@@ -101,3 +103,9 @@ Setu/
 
 #### 📄 [llama_server.log](file:///c:/Users/Tanay%20Sinha/OneDrive/Desktop/Setu/llama_server.log)
 * **Purpose:** Captured stdout/stderr logs of the running `llama-server.exe` subprocess. Used to analyze prompt token counts, prompt processing speeds, decoding speeds, slots allocation, and error stack traces.
+
+#### 📄 [routing_engine.py](file:///c:/Users/Tanay%20Sinha/OneDrive/Desktop/Setu/routing_engine.py)
+* **Purpose:** Implements the credit risk routing engine. Evaluates structured financial extractions using anomaly-first logic: escalates to cloud if anomalies exist or if confidence < 0.7; otherwise processes locally. Includes 3 unit tests.
+
+#### 📄 [pipeline.py](file:///c:/Users/Tanay%20Sinha/OneDrive/Desktop/Setu/pipeline.py)
+* **Purpose:** Chained pipeline script that integrates both `extract_sms.py` and `routing_engine.py`. Executes the full extraction-and-routing flow on the 5 vendor scenarios in a single pass.
