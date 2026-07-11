@@ -112,6 +112,37 @@ const LEDGER_VISION_HIGH: AssessmentResponse = {
   routing_reason: 'ledger_photo: local vision unsupported',
 };
 
+const VOICE_NOTE_LOW: AssessmentResponse = {
+  route: 'escalate',
+  escalation_method: 'google-adk Managed Agent (iAPI, Audio LlmAgent, gemini-3.5-flash)',
+  risk_score: 63.0,
+  risk_category: 'low',
+  explanation:
+    'Voice note describes consistent vegetable vending income of ₹3,000–₹4,000 per day. ' +
+    'Borrower mentions daily morning market payments from regular customers and occasional ' +
+    'bulk orders from a local restaurant. Narrative is natural and self-consistent. LOW risk.',
+  confidence_score: null,
+  anomaly_flags: [],
+  latency_ms: 8900,
+  routing_reason: 'voice_note: local audio transcription unsupported',
+};
+
+const VOICE_NOTE_MEDIUM: AssessmentResponse = {
+  route: 'escalate',
+  escalation_method: 'google-adk Managed Agent (iAPI, Audio LlmAgent, gemini-3.5-flash)',
+  risk_score: 42.0,
+  risk_category: 'medium',
+  explanation:
+    'Borrower describes income of ₹2,000–₹8,000 per day, a very wide spread. ' +
+    'The response sounds partially coached — generic phrases, no specific customer names or ' +
+    'transaction details. One mention of ₹15,000 in a single day could not be corroborated. ' +
+    'Assigning MEDIUM risk pending field verification.',
+  confidence_score: null,
+  anomaly_flags: ['revenue_spike', 'narrative_vague'],
+  latency_ms: 10300,
+  routing_reason: 'voice_note: local audio transcription unsupported',
+};
+
 // ── SMS sample-index to mock response mapping ──────────────────────────────
 
 const SMS_MOCK_RESPONSES: AssessmentResponse[] = [
@@ -142,7 +173,12 @@ export async function getMockResponse(
   let response: AssessmentResponse;
   let delayMs: number;
 
-  if (req.source_type === 'ledger_photo') {
+  if (req.source_type === 'voice_note') {
+    // Alternate between two voice note mock responses
+    const isAnomaly = req.borrower_session_id?.includes('2') || req.borrower_session_id?.includes('medium');
+    response = isAnomaly ? { ...VOICE_NOTE_MEDIUM } : { ...VOICE_NOTE_LOW };
+    delayMs = isFallback ? 500 : 5000 + Math.random() * 3000; // 5-8s simulated transcription
+  } else if (req.source_type === 'ledger_photo') {
     // Try to match a specific ledger sample
     const key = Object.keys(LEDGER_MOCK_MAP).find((k) =>
       req.borrower_session_id?.toLowerCase().includes(k),

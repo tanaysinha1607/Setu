@@ -25,7 +25,9 @@ export async function submitAssessment(
   }
 
   const timeoutMs =
-    req.source_type === 'ledger_photo' ? TIMEOUT_ESCALATE_MS : TIMEOUT_SMS_MS;
+    req.source_type === 'ledger_photo' || req.source_type === 'voice_note'
+      ? TIMEOUT_ESCALATE_MS
+      : TIMEOUT_SMS_MS;
 
   try {
     const controller = new AbortController();

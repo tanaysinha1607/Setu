@@ -9,6 +9,8 @@ export interface ProcessRequest {
   raw_text?: string;
   /** Base64-encoded image data URL — required for source_type === 'ledger_photo' */
   image_data_base64?: string;
+  /** Base64-encoded audio data URL — required for source_type === 'voice_note' */
+  audio_data_base64?: string;
   /** Session identifier for this borrower assessment */
   borrower_session_id: string;
 }
@@ -30,7 +32,7 @@ export interface AssessmentResponse {
 export type AppPhase = 'hero' | 'input' | 'processing' | 'result';
 
 /** Input modality selected by the user */
-export type InputType = 'sms' | 'photo' | null;
+export type InputType = 'sms' | 'photo' | 'voice' | null;
 
 /** Shape of the Zustand global state store */
 export interface AppState {

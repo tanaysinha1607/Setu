@@ -115,8 +115,8 @@ function ModeCard({
             fontSize: '0.65rem',
             padding: '2px 8px',
             borderRadius: '99px',
-            background: 'rgba(245, 158, 11, 0.15)',
-            color: 'var(--setu-gold)',
+            background: 'rgba(45,212,191,0.15)',
+            color: 'var(--setu-teal)',
             fontWeight: 600,
             letterSpacing: '0.03em',
           }}
@@ -153,6 +153,14 @@ export default function InputSelector() {
   const [selectedLedger, setSelectedLedger] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ── Voice note state ──
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [audioBase64, setAudioBase64] = useState<string | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
+  const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
+  const audioInputRef = useRef<HTMLInputElement>(null);
+
   const handleSmsSubmit = () => {
     if (!smsText.trim()) return;
     const sampleIdx = selectedSample ?? 0;
@@ -170,6 +178,16 @@ export default function InputSelector() {
       source_type: 'ledger_photo',
       image_data_base64: imageBase64,
       borrower_session_id: `demo_${selectedLedger || 'upload'}_${Date.now()}`,
+    };
+    startAssessment(req);
+  };
+
+  const handleVoiceSubmit = () => {
+    if (!audioBase64) return;
+    const req: ProcessRequest = {
+      source_type: 'voice_note',
+      audio_data_base64: audioBase64,
+      borrower_session_id: `demo_voice_${Date.now()}`,
     };
     startAssessment(req);
   };
@@ -201,6 +219,48 @@ export default function InputSelector() {
       setImageBase64(result);
     };
     reader.readAsDataURL(file);
+  };
+
+  // ── Voice note audio handlers ─────────────────────────────────────────────
+  const handleAudioFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setAudioFile(file);
+    const reader = new FileReader();
+    reader.onload = () => {
+      setAudioBase64(reader.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+      mr.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      mr.onstop = () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        setAudioFile(new File([blob], 'recording.webm', { type: 'audio/webm' }));
+        const reader = new FileReader();
+        reader.onload = () => setAudioBase64(reader.result as string);
+        reader.readAsDataURL(blob);
+        stream.getTracks().forEach((t) => t.stop());
+      };
+      mr.start();
+      setMediaRecorder(mr);
+      setRecordedChunks(chunks);
+      setIsRecording(true);
+    } catch (err) {
+      console.warn('Microphone access denied:', err);
+      alert('Microphone access denied. Please upload an audio file instead.');
+    }
+  };
+
+  const stopRecording = () => {
+    mediaRecorder?.stop();
+    setIsRecording(false);
+    setMediaRecorder(null);
   };
 
   return (
@@ -277,10 +337,9 @@ export default function InputSelector() {
             icon="🎙️"
             title="Voice Note"
             description="Field officer Q&A"
-            active={false}
-            disabled
-            badge="In Progress"
-            onClick={() => {}}
+            active={inputType === 'voice'}
+            badge="New"
+            onClick={() => setInputType('voice')}
           />
         </div>
 
@@ -538,6 +597,180 @@ export default function InputSelector() {
                 }}
               >
                 Escalate to Cloud Vision →
+              </motion.button>
+            </motion.div>
+          )}
+
+          {/* ── Voice note sub-panel ──────────────────────────────────────── */}
+          {inputType === 'voice' && (
+            <motion.div
+              key="voice-panel"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              style={{ overflow: 'hidden' }}
+            >
+              <div className="glass" style={{ padding: '1.25rem', marginBottom: '1rem' }}>
+                <label
+                  style={{
+                    fontSize: '0.8rem',
+                    fontWeight: 500,
+                    color: 'var(--text-secondary)',
+                    marginBottom: '0.75rem',
+                    display: 'block',
+                  }}
+                >
+                  Record or upload a borrower voice note
+                </label>
+
+                {/* Record button */}
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                  <motion.button
+                    whileHover={{ scale: 1.03 }}
+                    whileTap={{ scale: 0.97 }}
+                    onClick={isRecording ? stopRecording : startRecording}
+                    style={{
+                      flex: 1,
+                      padding: '0.75rem',
+                      borderRadius: '10px',
+                      border: isRecording
+                        ? '1px solid #ef4444'
+                        : '1px solid var(--setu-border)',
+                      background: isRecording
+                        ? 'rgba(239,68,68,0.15)'
+                        : 'var(--setu-surface)',
+                      color: isRecording ? '#ef4444' : 'var(--text-secondary)',
+                      cursor: 'pointer',
+                      fontFamily: 'var(--font-body)',
+                      fontWeight: 600,
+                      fontSize: '0.82rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '0.4rem',
+                    }}
+                  >
+                    {isRecording ? (
+                      <>
+                        <motion.span
+                          animate={{ opacity: [1, 0.2, 1] }}
+                          transition={{ repeat: Infinity, duration: 1 }}
+                        >
+                          ●
+                        </motion.span>
+                        Stop Recording
+                      </>
+                    ) : (
+                      <>🎙️ Start Recording</>
+                    )}
+                  </motion.button>
+                  <button
+                    onClick={() => audioInputRef.current?.click()}
+                    style={{
+                      padding: '0.75rem 1rem',
+                      borderRadius: '10px',
+                      border: '1px solid var(--setu-border)',
+                      background: 'var(--setu-surface)',
+                      color: 'var(--text-secondary)',
+                      cursor: 'pointer',
+                      fontFamily: 'var(--font-body)',
+                      fontSize: '0.82rem',
+                    }}
+                  >
+                    📂 Upload
+                  </button>
+                </div>
+                <input
+                  ref={audioInputRef}
+                  type="file"
+                  accept="audio/*,.wav,.mp3,.ogg,.m4a,.webm"
+                  onChange={handleAudioFileChange}
+                  style={{ display: 'none' }}
+                />
+
+                {/* Audio preview */}
+                {audioFile && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    style={{
+                      padding: '0.75rem',
+                      borderRadius: '10px',
+                      border: '1px solid var(--setu-teal)',
+                      background: 'var(--setu-teal-dim)',
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: '0.75rem',
+                        color: 'var(--setu-teal)',
+                        fontWeight: 600,
+                        marginBottom: '0.4rem',
+                      }}
+                    >
+                      🎵 {audioFile.name} ({(audioFile.size / 1024).toFixed(1)} KB)
+                    </div>
+                    <audio
+                      controls
+                      src={audioBase64 ?? undefined}
+                      style={{ width: '100%', height: '32px' }}
+                    />
+                  </motion.div>
+                )}
+
+                {!audioFile && (
+                  <div
+                    style={{
+                      padding: '1rem',
+                      borderRadius: '10px',
+                      border: '2px dashed var(--setu-border)',
+                      textAlign: 'center',
+                      color: 'var(--text-muted)',
+                      fontSize: '0.78rem',
+                    }}
+                  >
+                    <div style={{ fontSize: '1.4rem', marginBottom: '0.35rem' }}>🎤</div>
+                    Record a voice note or upload a .wav / .mp3 / .m4a file
+                  </div>
+                )}
+
+                <p
+                  style={{
+                    fontSize: '0.72rem',
+                    color: 'var(--text-muted)',
+                    marginTop: '0.6rem',
+                    lineHeight: 1.5,
+                  }}
+                >
+                  Audio is sent to the Gemini cloud agent for transcription and credit analysis.
+                  No data is stored.
+                </p>
+              </div>
+
+              <motion.button
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={handleVoiceSubmit}
+                disabled={!audioBase64}
+                style={{
+                  width: '100%',
+                  padding: '14px',
+                  borderRadius: '12px',
+                  border: 'none',
+                  cursor: audioBase64 ? 'pointer' : 'not-allowed',
+                  fontFamily: 'var(--font-display)',
+                  fontWeight: 600,
+                  fontSize: '0.95rem',
+                  background: audioBase64
+                    ? 'linear-gradient(135deg, #818cf8, #6366f1)'
+                    : 'rgba(255,255,255,0.05)',
+                  color: audioBase64 ? '#fff' : 'var(--text-muted)',
+                  boxShadow: audioBase64
+                    ? '0 0 20px rgba(99,102,241,0.35)'
+                    : 'none',
+                }}
+              >
+                Escalate to Cloud Audio Agent →
               </motion.button>
             </motion.div>
           )}

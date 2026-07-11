@@ -345,7 +345,7 @@ export default function ResultCard() {
                 marginTop: '2px',
               }}
             >
-              {result.route.toUpperCase()}
+              {result.route === 'escalate' ? '☁ CLOUD' : '⚡ LOCAL'}
             </div>
           </div>
           <div>
@@ -371,8 +371,12 @@ export default function ResultCard() {
                 color: result.anomaly_flags.length > 0 ? 'var(--risk-high)' : 'var(--text-primary)',
               }}
             >
-              {result.anomaly_flags.length > 0
-                ? result.anomaly_flags.join(', ')
+              {result.anomaly_flags && result.anomaly_flags.length > 0
+                ? result.anomaly_flags.map((f, i) => (
+                    <span key={i} style={{ display: 'block', fontSize: '0.72rem', lineHeight: 1.4 }}>
+                      • {f.replace(/_/g, ' ')}
+                    </span>
+                  ))
                 : 'None'}
             </div>
           </div>

@@ -1,32 +1,43 @@
 # Project Setu: Summary & Overview
 
 ## The Idea
-**Project Setu** is an adaptive AI routing system designed for microfinance credit risk assessment. It aims to extract structured financial metrics from messy inputs such as SMS logs, ledger photos, and voice notes. It evaluates the credit risk of microfinance borrowers based on these inputs.
+**Project Setu** is an adaptive AI routing system designed for microfinance credit risk assessment. It aims to extract structured financial metrics from messy informal inputs such as SMS logs, ledger photos, and voice notes. It evaluates the credit risk of microfinance borrowers based on these inputs.
 
-The system is built on a three-tier architecture:
-1. **Local Layer:** A local instance of the **Gemma 4 E4B** model runs via `llama.cpp` to parse messy inputs and extract structured financial metrics. This helps in low-latency and privacy-preserving initial processing.
-2. **Escalation Routing:** The local system calculates confidence scores and identifies anomaly flags. If the confidence is low or there is a significant anomaly, the data is escalated to a cloud-hosted Gemini model for deeper validation.
+The system is built on a hybrid architecture:
+1. **Local Layer:** A local instance of the **Gemma 4 E4B** model runs via `llama.cpp` to parse SMS inputs and extract structured financial metrics. This helps in low-latency, privacy-preserving, and offline-capable initial processing.
+2. **Escalation Routing:** The local system calculates confidence scores and identifies anomaly flags. If the confidence is low or there is a significant anomaly, the data is escalated to a cloud-hosted Gemini model for deeper validation. Ledger photos and voice notes are automatically escalated because local models lack vision and audio capabilities.
 3. **Voice/Interactivity:** A voice layer is integrated, enabling field officers to perform interactive spoken Q&A using the Gemini Live API.
+
+---
 
 ## File Breakdown
 
-Here is a brief overview of what each file in the repository does:
+Here is a comprehensive overview of the files in the repository:
 
-### Core Scripts
-* **`extract_sms.py`**: The main Python script responsible for local structured data extraction. It starts a local `llama-server.exe`, sends UPI SMS logs to the server, formats responses, and validates them against the required schema. It handles fallbacks and retry logic if parsing fails.
-* **`routing_engine.py`**: Handles the logic for escalation routing. It checks the confidence scores and anomaly flags from the local layer and decides whether to route the data to the cloud-hosted Gemini model.
-* **`benchmark.py`**: A utility script used to measure the startup time and sequential inference latencies of the local `llama-server.exe`, helping evaluate the host machine's hardware capabilities for running the local model.
+### Core Pipeline & Routing
+* **`pipeline.py`**: Chains the local SMS extraction layer, ledger photo pipelines, and voice note pipelines with the backend scoring service. It prepares base64 payloads for images and audio files and sets routing fields (`route`, `routing_reason`).
+* **`routing_engine.py`**: Handles the logical criteria for credit assessment routing. It checks confidence scores, transaction frequencies, and anomaly flags to determine if the local score is sufficient or if the case must route to the cloud.
+* **`extract_sms.py`**: Coordinates starting and stopping the local `llama-server.exe` subprocess and performs local structured data extraction via prompt templates sent to the Gemma model.
 
-### Schema & Data Structures
-* **`schema.json`**: A JSON Schema Draft-07 file that defines the target extraction object (`BorrowerFinancialData`). It enforces the structure of the data extracted, ensuring it contains fields like `daily_revenue_estimate`, `confidence_score`, and `anomaly_flags`.
-* **`schema_documentation.md`**: Provides plain-English documentation detailing each field within `schema.json`, its data types, and logical constraints to help align the AI prompts with the expected output format.
+### Modality & Interactivity Scripts
+* **`voice_qa.py`**: Standalone real-time interactive audio prototype using the Gemini Live API (`google-genai`). It implements push-to-talk recording, handles a real-time conversational session, and grounds responses on a mock borrower's credit profile (Ramesh).
+* **`test_voice_note.py`**: E2E validation script for the voice note input pipeline. It scans `./audio/` for audio files, encodes them to base64 Data URLs, calls the backend, and presents the assessment results.
 
-### Models & Binaries
-* **`google_gemma-4-E4B-it-Q4_K_M_v2.gguf`**: The actual quantized 4-bit model weights of Google's Edge-optimized Gemma 4 E4B instruction-tuned model.
-* **`llama-bin/`**: A directory containing the compiled core executable files for `llama.cpp` on Windows, including `llama-server.exe` and `llama.exe`.
-* **`llama-cpu-x64.zip`**: The original zip bundle of the `llama.cpp` CPU execution binaries.
+### Backend Application
+* **`backend/main.py`**: FastAPI application containing the assessment endpoints. It performs local weighted scoring for SMS data (`route="local"`) or runs cloud-based Gemini Managed Agents via `google-adk` to process escalated text, handwritten ledger photos (Vision), and voice notes (Audio).
+* **`backend/main_no_adk.py`**: Fallback server implementation using direct `google-genai` SDK calls, bypassing `google-adk` if necessary.
 
-### Documentation & Logs
-* **`project_overview.md`**: The original comprehensive documentation outlining the project's folder structure and technical details.
-* **`.agents/AGENTS.md`**: Outlines workspace rules, hackathon guidelines (e.g., for the Google DeepMind Bangalore Hackathon), and constraints.
-* **`llama_server.log`**: Standard execution logs generated by the running `llama-server.exe` subprocess for tracking performance and errors.
+### Schema & Metadata
+* **`schema.json`**: Defines the target extraction object structure (`BorrowerFinancialData`), enforcing data types for modalities (including `image_data_base64` and `audio_data_base64`).
+* **`schema_documentation.md`**: Provides plain-English documentation detailing each field within `schema.json` and logical constraints.
+
+### Test & Utility Scripts
+* **`benchmark.py`**: Utility script to measure local `llama-server.exe` startup times and sequential inference latencies.
+* **`test_ledger_images.py`**: Evaluates the vision analysis capabilities of the backend against sample handwritten ledger images in the `images/` directory.
+* **`test_endpoints.py`**: Runs health check and payload parsing tests against the FastAPI backend.
+* **`test_schema_fix.py` / `test_adk_agent.py` / `test_adk_multimodal.py`**: Various integration tests verifying ADK agent setup, JSON parsing robustness, and temperature controls.
+
+### Documentation
+* **`project_overview.md`**: Original comprehensive documentation detailing the project's folder structure, API details, and routing design.
+* **`voice_capabilities_summary.md`**: Dedicated user guide detailing the architecture, implementation, and testing steps for the Voice QA and Voice Note layers.
+* **`hackathon_update.md`**: Tracking sheet detailing changes, fixes, and implemented modules for submission.

@@ -82,6 +82,9 @@ class AssessmentResponse(BaseModel):
     latency_ms: float
     # Tells judges which escalation path fired
     escalation_method: str | None = None
+    # Pass-through fields expected by the frontend
+    confidence_score: float | None = None
+    anomaly_flags: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -136,28 +139,34 @@ def _build_local_explanation(req: AssessmentRequest, score: float, category: str
 
 _AGENT_SYSTEM_PROMPT = """\
 You are a senior credit risk analyst specialising in microfinance for informal-sector \
-small businesses in India. You receive structured financial data that a local ML model \
-flagged as anomalous or low-confidence and could not safely score on its own.
+small businesses in India. You receive financial data for a borrower case that a local \
+model flagged as requiring human-grade cloud analysis.
 
 Your job:
-1. Reason carefully over the flagged signals. Consider whether each anomaly flag \
-   (e.g. "revenue_spike") is likely a one-off legitimate event (festival bonus, \
-   bulk order, salary credit, advance payment from a wholesaler) or a genuine red \
-   flag (fabricated data, money laundering, loan stacking). Weigh the raw extracted \
-   text as primary evidence.
-2. Produce a conservative but fair risk_score between 0 and 100 \
-   (higher = MORE creditworthy / LOWER risk).
-3. Classify the risk_category as exactly one of: "low", "medium", or "high".
-4. Write a clear, concise explanation (2-4 sentences) of your reasoning — \
-   your thought process, not just the verdict.
+1. Reason carefully over the raw transaction text. It is the ground truth — prioritise \
+   it over any structured fields marked 'unknown'.
+2. Identify ALL anomalies present. An anomaly is ANYTHING unusual:
+   - A transaction that is 3x or more above the borrower's typical amount → "revenue_spike"
+   - Inconsistent or unverifiable income sources → "unverified_income_source"
+   - Very few transactions (< 3 data points) → "insufficient_data"
+   - Round-number entries that look fabricated → "suspected_fabrication"
+   - Coached or vague narrative → "narrative_vague"
+   - Any other concern → use a descriptive snake_case string
+   CRITICAL: if your explanation mentions an anomaly, that anomaly MUST appear in anomaly_flags.
+3. Produce a conservative risk_score between 0 and 100 (higher = MORE creditworthy / LOWER risk).
+4. Classify risk_category as exactly one of: "low", "medium", or "high".
+5. Write a concise explanation (2-4 sentences) of your reasoning.
+6. Set confidence_score (0.0-1.0) reflecting how confident you are given data quality and completeness.
 
-Return ONLY a JSON object with exactly these keys:
+Return ONLY a JSON object — no markdown, no preamble:
 {
   "risk_score": <number 0-100>,
   "risk_category": "low" | "medium" | "high",
-  "explanation": "<string>"
+  "explanation": "<string>",
+  "confidence_score": <float 0.0-1.0>,
+  "anomaly_flags": ["<snake_case_flag>", ...]
 }
-No markdown, no preamble, no extra keys.
+If no anomalies exist, anomaly_flags must be [].
 """
 
 _VISION_AGENT_SYSTEM_PROMPT = """\
@@ -166,24 +175,28 @@ small businesses in India. You receive an image of a handwritten or printed ledg
 
 Your job:
 1. Parse the image carefully. Read all visible daybook or ledger entries, transaction dates, descriptions, and amounts.
-2. Formulate a credit risk assessment of the business grounded ONLY on what you can read from the ledger image:
+2. Formulate a credit risk assessment grounded ONLY on what you can read from the ledger image:
    - Calculate or estimate the typical daily/weekly revenue shown.
-   - Gauge payment consistency (are payments daily? highly irregular? clustered?).
-   - Evaluate revenue variance (highly volatile transaction sizes vs. stable).
-3. Check for typical informal daybook credit anomalies or red flags:
-   - Inconsistent handwriting/ink across entries that claim to be from different dates (indicating post-facto fabrication).
-   - Identical, round-number transaction amounts or patterns that look too clean.
-   - Daybook layout lacking expected business operational notes or signatures.
-4. Assign a conservative but fair risk_score between 0 and 100 \
-   (higher = MORE creditworthy / LOWER risk).
-5. Classify the risk_category as exactly one of: "low", "medium", or "high".
-6. Write a clear, concise explanation (2-4 sentences) summarizing exactly what transactions you read (dates and amounts) and your credit risk reasoning.
+   - Gauge payment consistency (daily? highly irregular? clustered?).
+   - Evaluate revenue variance (volatile vs. stable transaction sizes).
+3. Identify ALL anomalies visible in the ledger:
+   - Inconsistent handwriting/ink across entries (post-facto fabrication) → "inconsistent_handwriting"
+   - Identical, round-number entries that look too clean → "suspected_fabrication"
+   - Very high outstanding balance relative to revenue → "high_debt_load"
+   - Any other concern → descriptive snake_case string
+   CRITICAL: if you mention an anomaly in your explanation, it MUST appear in anomaly_flags.
+4. Assign a conservative but fair risk_score between 0 and 100 (higher = MORE creditworthy / LOWER risk).
+5. Classify risk_category as exactly one of: "low", "medium", or "high".
+6. Write a clear explanation (2-4 sentences) summarizing what transactions you read and your reasoning.
+7. Set confidence_score (0.0-1.0) based on image legibility and data completeness.
 
-Return ONLY a valid JSON object — no markdown, no preamble, no chain-of-thought — with exactly these keys:
+Return ONLY a valid JSON object — no markdown, no preamble:
 {
   "risk_score": <number 0-100>,
   "risk_category": "low" | "medium" | "high",
-  "explanation": "<string>"
+  "explanation": "<string>",
+  "confidence_score": <float 0.0-1.0>,
+  "anomaly_flags": ["<snake_case_flag>", ...]
 }
 Your ENTIRE response must be this JSON object and nothing else.
 """
@@ -191,21 +204,63 @@ Your ENTIRE response must be this JSON object and nothing else.
 
 def _build_agent_user_message(req: AssessmentRequest) -> str:
     """Construct the user-turn message fed to Gemini."""
-    flags_str = ", ".join(req.anomaly_flags) if req.anomaly_flags else "none"
+    flags_str = ", ".join(req.anomaly_flags) if req.anomaly_flags else "none pre-detected (infer from raw text below)"
+
+    # When pipeline couldn't run, confidence is the sentinel 0.5 — show as "unknown"
+    # so Gemini doesn't anchor on it and forms its own confidence judgement.
+    pipeline_ran = req.confidence_score != 0.5 or bool(req.anomaly_flags)
+    conf_str = f"{req.confidence_score:.0%}" if pipeline_ran else "unknown (pipeline unavailable — use raw text as sole input)"
+
+    # Likewise, revenue/variance/consistency are 0/low/low when pipeline fallback fires
+    if not pipeline_ran and req.daily_revenue_estimate == 0.0:
+        revenue_str = "unknown (parse from raw text)"
+        variance_str = "unknown"
+        consistency_str = "unknown"
+    else:
+        revenue_str = f"₹{req.daily_revenue_estimate:,.2f}"
+        variance_str = req.revenue_variance
+        consistency_str = req.payment_consistency
+
     return (
         f"ESCALATION CASE — BORROWER SESSION: {req.borrower_session_id}\n\n"
         f"Financial data (extracted from {req.source_type.replace('_', ' ')}):\n"
-        f"  • Daily revenue estimate : ₹{req.daily_revenue_estimate:,.2f}\n"
-        f"  • Revenue variance       : {req.revenue_variance}\n"
-        f"  • Payment consistency    : {req.payment_consistency}\n"
-        f"  • Extraction confidence  : {req.confidence_score:.0%}\n"
+        f"  • Daily revenue estimate : {revenue_str}\n"
+        f"  • Revenue variance       : {variance_str}\n"
+        f"  • Payment consistency    : {consistency_str}\n"
+        f"  • Extraction confidence  : {conf_str}\n"
         f"  • Anomaly flags          : {flags_str}\n\n"
         f"Routing reason (why local model could not score this):\n"
         f"  {req.routing_reason}\n\n"
-        f"Raw extracted text (primary evidence — treat as ground truth):\n"
+        f"Raw extracted text (primary evidence — treat as ground truth over structured fields above):\n"
         f"\"\"\"\n{req.raw_extracted_text}\n\"\"\"\n\n"
         f"Please analyse and return the JSON risk assessment."
     )
+
+
+def _extract_flags_from_explanation(explanation: str, existing_flags: list[str]) -> list[str]:
+    """
+    Post-processing safety net: keyword-scans Gemini's explanation and injects
+    standard anomaly flags if they're described in text but not in the JSON array.
+    Prevents the common failure mode where Gemini describes an anomaly in prose
+    but returns anomaly_flags: [].
+    """
+    flags = list(existing_flags)  # copy
+    text = explanation.lower()
+
+    checks = [
+        ("revenue_spike",           ["spike", "20x", "10x", "unusual", "unexplained", "large payment", "corporate", "one-off", "outsized"]),
+        ("suspected_fabrication",   ["fabricat", "identical", "round-number", "uniform amount", "written in one"]),
+        ("narrative_vague",         ["vague", "coached", "generic", "scripted", "unnatural"]),
+        ("insufficient_data",       ["insufficient", "limited data", "only one day", "single day", "few transactions"]),
+        ("unverified_income_source", ["unexplained", "unverified", "unknown source", "cannot corroborate"]),
+        ("inconsistent_handwriting", ["inconsistent handwriting", "ink", "written in one sitting"]),
+    ]
+
+    for flag_name, keywords in checks:
+        if flag_name not in flags and any(kw in text for kw in keywords):
+            flags.append(flag_name)
+
+    return flags
 
 
 def _parse_gemini_json(text: str) -> dict:
@@ -261,8 +316,9 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
         instruction=_AGENT_SYSTEM_PROMPT,
         generate_content_config=GenerateContentConfig(
             temperature=0.2,               # low temp = consistent, fact-grounded scores
-            max_output_tokens=1024,
-            response_mime_type="application/json",  # no preamble, pure JSON only
+            max_output_tokens=4096,        # 1024 caused unterminated-string truncation on explanation
+            # NOTE: response_mime_type="application/json" intentionally omitted.
+            # Causes JSON truncation on developer API keys. Prompt + _parse_gemini_json handles it.
         ),
     )
 
@@ -336,7 +392,7 @@ def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
         instruction=_VISION_AGENT_SYSTEM_PROMPT,
         generate_content_config=GenerateContentConfig(
             temperature=0.2,               # low temp = grounded in image facts, not heuristic defaults
-            max_output_tokens=2048,
+            max_output_tokens=4096,        # 2048 could still truncate long vision explanations
             # NOTE: response_mime_type="application/json" is intentionally omitted here.
             # JSON output mode is incompatible with multimodal (image) inputs on this API
             # configuration — it causes truncated output. The vision prompt + _parse_gemini_json
@@ -515,8 +571,10 @@ def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
         config=genai_types.GenerateContentConfig(
             system_instruction=_AGENT_SYSTEM_PROMPT,
             temperature=0.2,           # low temp = consistent, deterministic risk scores
-            max_output_tokens=1024,
-            response_mime_type="application/json",
+            max_output_tokens=4096,    # 1024 caused unterminated-string truncation
+            # NOTE: response_mime_type="application/json" is intentionally omitted.
+            # It causes JSONDecodeError/truncation on the developer API tier.
+            # The _AGENT_SYSTEM_PROMPT instructs JSON-only output; _parse_gemini_json handles extraction.
         ),
     )
 
@@ -532,10 +590,13 @@ def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
 # Escalation orchestrator — tries ADK first, then falls back
 # ---------------------------------------------------------------------------
 
-def _escalate_to_gemini(req: AssessmentRequest) -> tuple[float | None, str, str, str]:
+def _escalate_to_gemini(
+    req: AssessmentRequest,
+) -> tuple[float | None, str, str, str, float | None, list[str]]:
     """
     Tries escalation paths in priority order.
-    Returns (risk_score, risk_category, explanation, method_label).
+    Returns (risk_score, risk_category, explanation, method_label, confidence_score, anomaly_flags).
+    confidence_score and anomaly_flags come from Gemini's JSON when available.
     """
     attempts = [
         ("ADK",        _call_adk_agent),
@@ -552,7 +613,26 @@ def _escalate_to_gemini(req: AssessmentRequest) -> tuple[float | None, str, str,
             if risk_category not in ("low", "medium", "high"):
                 risk_category = _categorise(risk_score)
             explanation = str(parsed["explanation"])
-            return risk_score, risk_category, explanation, method
+
+            # confidence_score: prefer Gemini's own value, fall back to pipeline extraction value
+            raw_conf = parsed.get("confidence_score")
+            if raw_conf is not None:
+                confidence_score = min(1.0, max(0.0, float(raw_conf)))
+            else:
+                confidence_score = req.confidence_score  # from pipeline (real value)
+
+            # anomaly_flags: merge Gemini's detections with pipeline's pre-flagged ones,
+            # then enrich from explanation text as a safety net
+            gemini_flags = parsed.get("anomaly_flags", [])
+            if isinstance(gemini_flags, list) and gemini_flags:
+                anomaly_flags = [str(f) for f in gemini_flags]
+            else:
+                anomaly_flags = req.anomaly_flags or []  # from pipeline (real value)
+
+            # Post-process: extract any flags described in explanation but missing from JSON
+            anomaly_flags = _extract_flags_from_explanation(explanation, anomaly_flags)
+
+            return risk_score, risk_category, explanation, method, confidence_score, anomaly_flags
 
         except ImportError:
             logger.info(f"[escalate] {label}: SDK not installed — trying next")
@@ -571,6 +651,8 @@ def _escalate_to_gemini(req: AssessmentRequest) -> tuple[float | None, str, str,
             f"Routing reason: {req.routing_reason}"
         ),
         "none (all escalation paths failed)",
+        None,
+        [],
     )
 
 
@@ -690,8 +772,17 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
                 if risk_category not in ("low", "medium", "high"):
                     risk_category = _categorise(risk_score)
                 explanation = str(parsed["explanation"])
+
+                # Extract confidence and flags from vision JSON, post-process explanation
+                raw_conf = parsed.get("confidence_score")
+                vis_confidence = min(1.0, max(0.0, float(raw_conf))) if raw_conf is not None else None
+
+                vis_flags_raw = parsed.get("anomaly_flags", [])
+                vis_flags = [str(f) for f in vis_flags_raw] if isinstance(vis_flags_raw, list) else []
+                vis_flags = _extract_flags_from_explanation(explanation, vis_flags)
+
                 latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
-                
+
                 return AssessmentResponse(
                     risk_score=risk_score,
                     risk_category=risk_category,
@@ -700,6 +791,8 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
                     routing_reason=req.routing_reason,
                     latency_ms=latency_ms,
                     escalation_method=method,
+                    confidence_score=vis_confidence,
+                    anomaly_flags=vis_flags,
                 )
             except Exception as e:
                 logger.warning(f"[assess] Vision escalation failed: {e!r}. Falling back to pending review stub.")
@@ -725,9 +818,12 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
         risk_score    = _compute_risk_score(req)
         risk_category = _categorise(risk_score)
         explanation   = _build_local_explanation(req, risk_score, risk_category)
+        # Use pipeline-extracted values for local path
+        confidence_score  = req.confidence_score
+        anomaly_flags_out = req.anomaly_flags
 
     elif req.route == "escalate":
-        risk_score, risk_category, explanation, escalation_method = _escalate_to_gemini(req)
+        risk_score, risk_category, explanation, escalation_method, confidence_score, anomaly_flags_out = _escalate_to_gemini(req)
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown route value: {req.route!r}")
@@ -742,4 +838,149 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
         routing_reason=req.routing_reason,
         latency_ms=latency_ms,
         escalation_method=escalation_method,
+        confidence_score=confidence_score,
+        anomaly_flags=anomaly_flags_out or [],
     )
+
+
+# ---------------------------------------------------------------------------
+# Frontend-facing /api/process endpoint
+# ---------------------------------------------------------------------------
+# The frontend sends a simple {source_type, raw_text|image_data_base64|audio_data_base64}
+# payload. This endpoint handles pipeline-level extraction/routing internally
+# and returns the full AssessmentResponse the frontend expects.
+
+class FrontendProcessRequest(BaseModel):
+    """Simple request shape sent by the React frontend."""
+    source_type: Literal["sms", "ledger_photo", "voice_note"]
+    raw_text: str | None = None
+    image_data_base64: str | None = None
+    audio_data_base64: str | None = None
+    borrower_session_id: str
+
+
+def _check_api_key() -> None:
+    """Raise a 503 with a clear message if the Gemini API key is missing."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GEMINI_API_KEY is not configured on this server. "
+                "Add it to the .env file in the project root and restart the backend."
+            ),
+        )
+
+
+@app.post("/api/process", response_model=AssessmentResponse)
+def api_process(req: FrontendProcessRequest) -> AssessmentResponse:
+    """
+    Frontend-facing unified endpoint.
+
+    Accepts the simple payload sent by the React UI and internally:
+      - SMS       → runs local pipeline extraction (Gemma), then local/escalate score
+      - Photo     → base64 image, runs cloud Vision ADK agent
+      - Voice     → base64 audio, runs cloud Audio ADK agent
+
+    Always requires GEMINI_API_KEY for escalation paths.
+    Returns 503 with a descriptive error if the key is absent.
+    """
+    import datetime as dt
+
+    # ── SMS path ──────────────────────────────────────────────────────────────
+    if req.source_type == "sms":
+        if not req.raw_text or not req.raw_text.strip():
+            raise HTTPException(status_code=400, detail="raw_text is required for source_type=sms")
+
+        # Try local Gemma pipeline extraction
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from pipeline import process_sms_input
+            extracted = process_sms_input(req.raw_text, req.borrower_session_id)
+        except Exception as pipeline_err:
+            logger.warning(
+                f"[api/process] Local SMS pipeline failed: {pipeline_err!r} "
+                f"— falling back to Gemini text extraction"
+            )
+            _check_api_key()
+            # Fallback: low-confidence escalation with raw text
+            extracted = {
+                "source_type": "sms",
+                "daily_revenue_estimate": 0.0,
+                "revenue_variance": "medium",
+                "payment_consistency": "medium",
+                "confidence_score": 0.5,
+                "anomaly_flags": [],
+                "raw_extracted_text": req.raw_text,
+                "route": "escalate",
+                "routing_reason": "pipeline unavailable; raw text escalated to Gemini",
+                "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "borrower_session_id": req.borrower_session_id,
+            }
+
+        internal_req = AssessmentRequest(
+            source_type=extracted["source_type"],
+            daily_revenue_estimate=float(extracted.get("daily_revenue_estimate", 0)),
+            revenue_variance=extracted.get("revenue_variance", "medium"),
+            payment_consistency=extracted.get("payment_consistency", "medium"),
+            confidence_score=float(extracted.get("confidence_score", 0.5)),
+            anomaly_flags=extracted.get("anomaly_flags", []),
+            raw_extracted_text=extracted.get("raw_extracted_text", req.raw_text or ""),
+            timestamp=extracted.get("timestamp", dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+            borrower_session_id=req.borrower_session_id,
+            route=extracted.get("route", "local"),
+            routing_reason=extracted.get("routing_reason", ""),
+        )
+
+        resp = assess(internal_req)
+        # NOTE: do NOT overwrite resp.confidence_score or resp.anomaly_flags here.
+        # assess() already computes them correctly via _escalate_to_gemini() which
+        # calls Gemini, runs the post-processor, and falls back to pipeline values.
+        return resp
+
+    # ── Ledger photo path ─────────────────────────────────────────────────────
+    if req.source_type == "ledger_photo":
+        if not req.image_data_base64 or not req.image_data_base64.strip():
+            raise HTTPException(status_code=400, detail="image_data_base64 is required for source_type=ledger_photo")
+        _check_api_key()
+
+        internal_req = AssessmentRequest(
+            source_type="ledger_photo",
+            daily_revenue_estimate=0.0,
+            revenue_variance="low",
+            payment_consistency="low",
+            confidence_score=0.0,
+            anomaly_flags=[],
+            raw_extracted_text="",
+            image_data_base64=req.image_data_base64,
+            timestamp=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            borrower_session_id=req.borrower_session_id,
+            route="escalate",
+            routing_reason="ledger_photo: local vision unsupported",
+        )
+        return assess(internal_req)
+
+    # ── Voice note path ───────────────────────────────────────────────────────
+    if req.source_type == "voice_note":
+        if not req.audio_data_base64 or not req.audio_data_base64.strip():
+            raise HTTPException(status_code=400, detail="audio_data_base64 is required for source_type=voice_note")
+        _check_api_key()
+
+        internal_req = AssessmentRequest(
+            source_type="voice_note",
+            daily_revenue_estimate=0.0,
+            revenue_variance="low",
+            payment_consistency="low",
+            confidence_score=0.0,
+            anomaly_flags=[],
+            raw_extracted_text="",
+            audio_data_base64=req.audio_data_base64,
+            timestamp=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            borrower_session_id=req.borrower_session_id,
+            route="escalate",
+            routing_reason="voice_note: local audio transcription unsupported",
+        )
+        return assess(internal_req)
+
+    raise HTTPException(status_code=400, detail=f"Unknown source_type: {req.source_type!r}")
