@@ -1,6 +1,8 @@
 # Ignore large model files
 *.gguf
 
+venv/
+.env
 # Ignore zip archives
 *.zip
 
