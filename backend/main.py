@@ -15,6 +15,7 @@ import os
 import re
 import json
 import time
+import base64
 import logging
 from datetime import datetime
 from typing import Literal
@@ -157,6 +158,34 @@ Return ONLY a JSON object with exactly these keys:
 No markdown, no preamble, no extra keys.
 """
 
+_VISION_AGENT_SYSTEM_PROMPT = """\
+You are a senior credit risk analyst specialising in microfinance for informal-sector \
+small businesses in India. You receive an image of a handwritten or printed ledger or daybook from a borrower's business.
+
+Your job:
+1. Parse the image carefully. Read all visible daybook or ledger entries, transaction dates, descriptions, and amounts.
+2. Formulate a credit risk assessment of the business grounded ONLY on what you can read from the ledger image:
+   - Calculate or estimate the typical daily/weekly revenue shown.
+   - Gauge payment consistency (are payments daily? highly irregular? clustered?).
+   - Evaluate revenue variance (highly volatile transaction sizes vs. stable).
+3. Check for typical informal daybook credit anomalies or red flags:
+   - Inconsistent handwriting/ink across entries that claim to be from different dates (indicating post-facto fabrication).
+   - Identical, round-number transaction amounts or patterns that look too clean.
+   - Daybook layout lacking expected business operational notes or signatures.
+4. Assign a conservative but fair risk_score between 0 and 100 \
+   (higher = MORE creditworthy / LOWER risk).
+5. Classify the risk_category as exactly one of: "low", "medium", or "high".
+6. Write a clear, concise explanation (2-4 sentences) summarizing exactly what transactions you read (dates and amounts) and your credit risk reasoning.
+
+Return ONLY a JSON object with exactly these keys:
+{
+  "risk_score": <number 0-100>,
+  "risk_category": "low" | "medium" | "high",
+  "explanation": "<string>"
+}
+No markdown, no preamble, no extra keys.
+"""
+
 
 def _build_agent_user_message(req: AssessmentRequest) -> str:
     """Construct the user-turn message fed to Gemini."""
@@ -253,6 +282,82 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
 
     parsed = _parse_gemini_json(final_text)
     return parsed, "google-adk Managed Agent (iAPI, LlmAgent, gemini-3.5-flash)"
+
+
+def _parse_base64_image(data_url: str) -> tuple[bytes, str]:
+    """
+    Parses a base64 data URL (e.g. 'data:image/png;base64,...')
+    and returns (raw_bytes, mime_type).
+    """
+    if not data_url.startswith("data:image/"):
+        try:
+            return base64.b64decode(data_url), "image/png"
+        except Exception as e:
+            raise ValueError(f"Invalid base64 payload: {e}")
+    
+    header, encoded = data_url.split(",", 1)
+    mime_type = header.split(";")[0].split(":")[1]
+    raw_bytes = base64.b64decode(encoded)
+    return raw_bytes, mime_type
+
+
+def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
+    """
+    Decodes the image_data_base64 and calls Gemini via google-adk
+    Managed Agent (iAPI) supporting multimodal vision inputs.
+    """
+    from google.adk.agents import LlmAgent
+    from google.adk.runners import InMemoryRunner
+    from google.genai.types import Content, Part
+
+    if not req.image_data_base64:
+        raise ValueError("Missing image_data_base64 in request for vision assessment")
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+    os.environ["GOOGLE_API_KEY"] = api_key
+
+    # Decode base64 image data
+    img_bytes, mime_type = _parse_base64_image(req.image_data_base64)
+
+    agent = LlmAgent(
+        name="setu_ledger_vision_analyst",
+        model="gemini-3.5-flash",
+        description="Senior credit risk analyst specializing in handwritten ledger vision OCR and underwriting.",
+        instruction=_VISION_AGENT_SYSTEM_PROMPT,
+    )
+
+    runner = InMemoryRunner(agent=agent, app_name="setu_vision")
+
+    # Start runner session
+    session = runner.session_service.create_session_sync(
+        app_name="setu_vision", user_id="backend_vision", session_id=req.borrower_session_id
+    )
+
+    # Wrap the image bytes and request as multimodal parts
+    parts = [
+        Part.from_bytes(data=img_bytes, mime_type=mime_type),
+        Part(text=(
+            f"Please analyze this ledger photo for borrower session {req.borrower_session_id}.\n"
+            f"Routing reason: {req.routing_reason}"
+        ))
+    ]
+
+    final_text = ""
+    for event in runner.run(
+        user_id="backend_vision",
+        session_id=session.id,
+        new_message=Content(role="user", parts=parts),
+    ):
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    final_text += part.text
+
+    parsed = _parse_gemini_json(final_text)
+    return parsed, "google-adk Managed Agent (iAPI, Vision LlmAgent, gemini-3.5-flash)"
 
 
 
@@ -399,26 +504,48 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
     t_start = time.perf_counter()
     escalation_method: str | None = None
 
-    # ── Ledger photo guard ───────────────────────────────────────────────────
-    # Until a real vision/OCR branch is built, ledger_photo payloads carry
-    # placeholder zeros and an empty raw_extracted_text.  Running the local
-    # formula or asking the ADK agent to reason over nothing would produce
-    # numbers we cannot explain — return an honest pending_review stub instead.
-    if req.source_type == "ledger_photo" and not req.raw_extracted_text.strip():
+    # ── Ledger photo guard / Vision path ─────────────────────────────────────
+    # If a ledger photo is sent with base64 image data, run our ADK vision analyst.
+    # If the vision call fails or if no image data was supplied, fall back to the
+    # honest pending_review stub.
+    if req.source_type == "ledger_photo":
+        if req.image_data_base64 and req.image_data_base64.strip():
+            try:
+                parsed, method = _call_adk_vision_agent(req)
+                risk_score = float(parsed["risk_score"])
+                risk_score = max(0.0, min(100.0, round(risk_score, 2)))
+                risk_category = str(parsed.get("risk_category", "")).lower()
+                if risk_category not in ("low", "medium", "high"):
+                    risk_category = _categorise(risk_score)
+                explanation = str(parsed["explanation"])
+                latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
+                
+                return AssessmentResponse(
+                    risk_score=risk_score,
+                    risk_category=risk_category,
+                    explanation=explanation,
+                    route="escalate",
+                    routing_reason=req.routing_reason,
+                    latency_ms=latency_ms,
+                    escalation_method=method,
+                )
+            except Exception as e:
+                logger.warning(f"[assess] Vision escalation failed: {e!r}. Falling back to pending review stub.")
+        
+        # Fallback pending review stub
         latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
         return AssessmentResponse(
             risk_score=None,
             risk_category="pending_review",
             explanation=(
-                "Ledger photo received and stored. "
-                "Automated vision/OCR extraction is not yet implemented — "
-                "a human reviewer must assess this submission before a risk "
-                "score can be assigned."
+                "Ledger photo received. Vision processing failed or was skipped. "
+                "A human reviewer must assess this daybook image before a risk score "
+                "can be assigned."
             ),
             route=req.route,
             routing_reason=req.routing_reason,
             latency_ms=latency_ms,
-            escalation_method=None,
+            escalation_method="fallback-stub",
         )
     # ── End ledger photo guard ───────────────────────────────────────────────
 
