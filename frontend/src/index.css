@@ -1,0 +1,155 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@300;400;500;600&display=swap');
+@import "tailwindcss";
+
+
+/* ── Design Tokens ────────────────────────────────────────────────────────── */
+:root {
+  /* Background */
+  --setu-bg: #0a0e1a;
+  --setu-bg-secondary: #0f1528;
+  --setu-surface: rgba(255, 255, 255, 0.04);
+  --setu-surface-hover: rgba(255, 255, 255, 0.08);
+  --setu-border: rgba(255, 255, 255, 0.08);
+
+  /* Accent: Teal = Local/Gemma */
+  --setu-teal: #2dd4bf;
+  --setu-teal-dim: rgba(45, 212, 191, 0.15);
+  --setu-teal-glow: rgba(45, 212, 191, 0.3);
+
+  /* Accent: Gold = Cloud/Gemini */
+  --setu-gold: #f59e0b;
+  --setu-gold-dim: rgba(245, 158, 11, 0.15);
+  --setu-gold-glow: rgba(245, 158, 11, 0.3);
+
+  /* Risk colors */
+  --risk-low: #2dd4bf;
+  --risk-medium: #f59e0b;
+  --risk-high: #ef4444;
+  --risk-pending: #6b7280;
+
+  /* Typography */
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --font-body: 'Inter', system-ui, sans-serif;
+
+  /* Text */
+  --text-primary: rgba(255, 255, 255, 0.95);
+  --text-secondary: rgba(255, 255, 255, 0.6);
+  --text-muted: rgba(255, 255, 255, 0.35);
+}
+
+/* ── Base reset & global styles ───────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-body);
+  background: var(--setu-bg);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── Utility classes ──────────────────────────────────────────────────────── */
+.font-display {
+  font-family: var(--font-display);
+}
+
+.glass {
+  background: var(--setu-surface);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--setu-border);
+  border-radius: 16px;
+}
+
+.glass-strong {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+}
+
+.gradient-text-teal {
+  background: linear-gradient(135deg, var(--setu-teal), #34d399);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gradient-text-gold {
+  background: linear-gradient(135deg, var(--setu-gold), #fbbf24);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.glow-teal {
+  box-shadow: 0 0 20px var(--setu-teal-glow), 0 0 60px rgba(45, 212, 191, 0.1);
+}
+
+.glow-gold {
+  box-shadow: 0 0 20px var(--setu-gold-glow), 0 0 60px rgba(245, 158, 11, 0.1);
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* ── Animations ───────────────────────────────────────────────────────────── */
+@keyframes pulse-teal {
+  0%, 100% { box-shadow: 0 0 10px var(--setu-teal-dim); }
+  50% { box-shadow: 0 0 30px var(--setu-teal-glow), 0 0 60px rgba(45, 212, 191, 0.15); }
+}
+
+@keyframes pulse-gold {
+  0%, 100% { box-shadow: 0 0 10px var(--setu-gold-dim); }
+  50% { box-shadow: 0 0 30px var(--setu-gold-glow), 0 0 60px rgba(245, 158, 11, 0.15); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.animate-pulse-teal { animation: pulse-teal 2s ease-in-out infinite; }
+.animate-pulse-gold { animation: pulse-gold 2s ease-in-out infinite; }
+.animate-float { animation: float 4s ease-in-out infinite; }
+
+.shimmer-bg {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.04) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s linear infinite;
+}

@@ -21,3 +21,5 @@ debug_server.py
 
 __pycache__
 *.png
+claude_context_update.md
+pipeline_output.txt
