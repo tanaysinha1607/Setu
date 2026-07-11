@@ -60,19 +60,20 @@ def process_ledger_photo_input(image_path: str, borrower_session_id: str) -> dic
     # 2. Construct timestamp
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     
-    # 3. Package payload matching schema.json with placeholders for skipped extraction
+    # 3. Package payload matching schema.json
     payload = {
         "source_type": "ledger_photo",
-        "daily_revenue_estimate": 0.0,            # Placeholder
+        "daily_revenue_estimate": 0.0,            # Placeholder — will be read by Gemini vision
         "revenue_variance": "low",                # Placeholder
         "payment_consistency": "low",             # Placeholder
         "confidence_score": 0.0,                  # Placeholder
         "anomaly_flags": [],                      # Placeholder
-        "raw_extracted_text": base64_image,       # Base64 data url containing image bytes
+        "raw_extracted_text": "",                 # Empty — text not available for photos
+        "image_data_base64": base64_image,        # Base64 data URL for Gemini vision
         "timestamp": timestamp_str,
         "borrower_session_id": borrower_session_id,
         "route": "escalate",                      # Hardcoded cloud escalation
-        "routing_reason": "ledger_photo: local vision unsupported" # Hardcoded reason
+        "routing_reason": "ledger_photo: local vision unsupported"
     }
     
     return payload

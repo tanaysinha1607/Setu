@@ -39,14 +39,17 @@ logger = logging.getLogger("setu")
 # ---------------------------------------------------------------------------
 
 class AssessmentRequest(BaseModel):
-    # ---- Fields from schema.json (all required) ----
+    # ---- Fields from schema.json ----
     source_type: Literal["sms", "ledger_photo", "voice_note"]
     daily_revenue_estimate: float = Field(..., ge=0)
     revenue_variance: Literal["low", "medium", "high"]
     payment_consistency: Literal["low", "medium", "high"]
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     anomaly_flags: list[str]
-    raw_extracted_text: str
+    # Optional: SMS/voice payloads populate this; ledger photo payloads may omit it
+    raw_extracted_text: str = ""
+    # Optional: ledger photo payloads carry the base64-encoded image here instead
+    image_data_base64: str | None = Field(default=None, description="Base64-encoded ledger photo (data URL). Populated by ledger_photo source_type only.")
     timestamp: str
     borrower_session_id: str
 
@@ -388,9 +391,36 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
 
     - route == 'local'    → weighted scoring function returns risk_score + category.
     - route == 'escalate' → calls Gemini API (ADK Managed Agent → direct-SDK fallback).
+
+    Special case: ledger_photo payloads with no extracted text yet return a
+    pending_review stub — the real vision/OCR branch is not yet implemented,
+    so we must not fabricate a score from placeholder zeros.
     """
     t_start = time.perf_counter()
     escalation_method: str | None = None
+
+    # ── Ledger photo guard ───────────────────────────────────────────────────
+    # Until a real vision/OCR branch is built, ledger_photo payloads carry
+    # placeholder zeros and an empty raw_extracted_text.  Running the local
+    # formula or asking the ADK agent to reason over nothing would produce
+    # numbers we cannot explain — return an honest pending_review stub instead.
+    if req.source_type == "ledger_photo" and not req.raw_extracted_text.strip():
+        latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
+        return AssessmentResponse(
+            risk_score=None,
+            risk_category="pending_review",
+            explanation=(
+                "Ledger photo received and stored. "
+                "Automated vision/OCR extraction is not yet implemented — "
+                "a human reviewer must assess this submission before a risk "
+                "score can be assigned."
+            ),
+            route=req.route,
+            routing_reason=req.routing_reason,
+            latency_ms=latency_ms,
+            escalation_method=None,
+        )
+    # ── End ledger photo guard ───────────────────────────────────────────────
 
     if req.route == "local":
         risk_score    = _compute_risk_score(req)
