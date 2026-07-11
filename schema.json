@@ -50,6 +50,14 @@
     "borrower_session_id": {
       "description": "Identifier linking multiple extraction records (SMS, ledger, voice) to the same borrower assessment session.",
       "type": "string"
+    },
+    "image_data_base64": {
+      "description": "Base64-encoded ledger photo (data URL). Populated by ledger_photo source_type only.",
+      "type": "string"
+    },
+    "audio_data_base64": {
+      "description": "Base64-encoded voice note audio (data URL, e.g. data:audio/wav;base64,...). Populated by voice_note source_type only.",
+      "type": "string"
     }
   },
   "required": [

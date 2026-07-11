@@ -51,6 +51,8 @@ class AssessmentRequest(BaseModel):
     raw_extracted_text: str = ""
     # Optional: ledger photo payloads carry the base64-encoded image here instead
     image_data_base64: str | None = Field(default=None, description="Base64-encoded ledger photo (data URL). Populated by ledger_photo source_type only.")
+    # Optional: voice note payloads carry the base64-encoded audio here
+    audio_data_base64: str | None = Field(default=None, description="Base64-encoded voice note audio (data URL). Populated by voice_note source_type only.")
     timestamp: str
     borrower_session_id: str
 
@@ -373,10 +375,122 @@ def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
     return parsed, "google-adk Managed Agent (iAPI, Vision LlmAgent, gemini-3.5-flash)"
 
 
+_AUDIO_AGENT_SYSTEM_PROMPT = """\
+You are a senior credit risk analyst specialising in microfinance for informal-sector \
+small businesses in India. You receive an audio voice note recorded by a borrower or a \
+field officer describing the borrower's income and business.
 
-# ---------------------------------------------------------------------------
-# Escalation path 2 — google-genai v2 SDK (direct, with agent-style prompt)
-# ---------------------------------------------------------------------------
+Your job:
+1. Transcribe the audio carefully. Extract all financial figures mentioned: \
+   daily/weekly income, typical revenue range, payment amounts, and any anomalies \
+   stated (missed payments, sudden windfalls, illness, slow season, etc.).
+2. Formulate a credit risk assessment grounded ONLY on what you can hear in the audio:
+   - Estimate daily revenue in Indian Rupees.
+   - Gauge payment consistency from the narrative (regular? seasonal? sporadic?).
+   - Evaluate revenue variance from the spread of figures mentioned.
+3. Check for red flags in the narrative:
+   - Conflicting figures (claims ₹500/day then mentions ₹15,000 sale).
+   - Coached or scripted sounding responses that don't match natural speech patterns.
+   - Unexplained large transactions or vague income sources.
+4. Assign a conservative but fair risk_score between 0 and 100 \
+   (higher = MORE creditworthy / LOWER risk).
+5. Classify the risk_category as exactly one of: "low", "medium", or "high".
+6. Write a clear, concise explanation (2-4 sentences) summarising what you heard \
+   (key figures and narrative) and your credit risk reasoning.
+
+Return ONLY a valid JSON object — no markdown, no preamble, no chain-of-thought — with exactly these keys:
+{
+  "risk_score": <number 0-100>,
+  "risk_category": "low" | "medium" | "high",
+  "explanation": "<string>"
+}
+Your ENTIRE response must be this JSON object and nothing else.
+"""
+
+
+def _parse_base64_audio(data_url: str) -> tuple[bytes, str]:
+    """
+    Parses a base64 data URL (e.g. 'data:audio/wav;base64,...')
+    and returns (raw_bytes, mime_type).
+    """
+    if not data_url.startswith("data:audio/"):
+        try:
+            return base64.b64decode(data_url), "audio/wav"
+        except Exception as e:
+            raise ValueError(f"Invalid audio base64 payload: {e}")
+
+    header, encoded = data_url.split(",", 1)
+    mime_type = header.split(";")[0].split(":")[1]
+    raw_bytes = base64.b64decode(encoded)
+    return raw_bytes, mime_type
+
+
+def _call_adk_audio_agent(req: AssessmentRequest) -> tuple[dict, str]:
+    """
+    Decodes the audio_data_base64 and calls Gemini via google-adk
+    Managed Agent (iAPI) supporting multimodal audio inputs.
+    Mirrors _call_adk_vision_agent() exactly — same structure, audio modality.
+    """
+    from google.adk.agents import LlmAgent
+    from google.adk.runners import InMemoryRunner
+    from google.genai.types import Content, Part, GenerateContentConfig
+
+    if not req.audio_data_base64:
+        raise ValueError("Missing audio_data_base64 in request for audio assessment")
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+    os.environ["GOOGLE_API_KEY"] = api_key
+
+    # Decode base64 audio data
+    audio_bytes, mime_type = _parse_base64_audio(req.audio_data_base64)
+
+    agent = LlmAgent(
+        name="setu_audio_voice_analyst",
+        model="gemini-3.5-flash",
+        description="Senior credit risk analyst specializing in voice note transcription and microfinance underwriting.",
+        instruction=_AUDIO_AGENT_SYSTEM_PROMPT,
+        generate_content_config=GenerateContentConfig(
+            temperature=0.2,               # low temp = grounded in audio facts, not heuristic defaults
+            max_output_tokens=2048,
+            # NOTE: response_mime_type="application/json" is intentionally omitted here.
+            # JSON output mode is incompatible with multimodal (audio) inputs on this API
+            # configuration — it causes truncated output. Same fix as vision agent.
+        ),
+    )
+
+    runner = InMemoryRunner(agent=agent, app_name="setu_audio")
+
+    session = runner.session_service.create_session_sync(
+        app_name="setu_audio", user_id="backend_audio", session_id=req.borrower_session_id
+    )
+
+    # Wrap the audio bytes and request as multimodal parts
+    parts = [
+        Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        Part(text=(
+            f"Please analyze this voice note for borrower session {req.borrower_session_id}.\n"
+            f"Routing reason: {req.routing_reason}"
+        ))
+    ]
+
+    final_text = ""
+    for event in runner.run(
+        user_id="backend_audio",
+        session_id=session.id,
+        new_message=Content(role="user", parts=parts),
+    ):
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    final_text += part.text
+
+    parsed = _parse_gemini_json(final_text)
+    return parsed, "google-adk Managed Agent (iAPI, Audio LlmAgent, gemini-3.5-flash)"
+
+
 
 def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
     """
@@ -516,6 +630,51 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
     """
     t_start = time.perf_counter()
     escalation_method: str | None = None
+
+    # ── Voice note guard / Audio path ────────────────────────────────────────
+    # If a voice note is sent with base64 audio data, run our ADK audio analyst.
+    # If the audio call fails or no audio data was supplied, fall back to the
+    # honest pending_review stub.
+    if req.source_type == "voice_note":
+        if req.audio_data_base64 and req.audio_data_base64.strip():
+            try:
+                parsed, method = _call_adk_audio_agent(req)
+                risk_score = float(parsed["risk_score"])
+                risk_score = max(0.0, min(100.0, round(risk_score, 2)))
+                risk_category = str(parsed.get("risk_category", "")).lower()
+                if risk_category not in ("low", "medium", "high"):
+                    risk_category = _categorise(risk_score)
+                explanation = str(parsed["explanation"])
+                latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
+
+                return AssessmentResponse(
+                    risk_score=risk_score,
+                    risk_category=risk_category,
+                    explanation=explanation,
+                    route="escalate",
+                    routing_reason=req.routing_reason,
+                    latency_ms=latency_ms,
+                    escalation_method=method,
+                )
+            except Exception as e:
+                logger.warning(f"[assess] Audio escalation failed: {e!r}. Falling back to pending review stub.")
+
+        # Fallback pending review stub
+        latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
+        return AssessmentResponse(
+            risk_score=None,
+            risk_category="pending_review",
+            explanation=(
+                "Voice note received. Audio processing failed or was skipped. "
+                "A human reviewer must listen to and assess this voice note before a "
+                "risk score can be assigned."
+            ),
+            route=req.route,
+            routing_reason=req.routing_reason,
+            latency_ms=latency_ms,
+            escalation_method="fallback-stub",
+        )
+    # ── End voice note guard ─────────────────────────────────────────────────
 
     # ── Ledger photo guard / Vision path ─────────────────────────────────────
     # If a ledger photo is sent with base64 image data, run our ADK vision analyst.
