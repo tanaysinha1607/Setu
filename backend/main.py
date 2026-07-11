@@ -177,13 +177,13 @@ Your job:
 5. Classify the risk_category as exactly one of: "low", "medium", or "high".
 6. Write a clear, concise explanation (2-4 sentences) summarizing exactly what transactions you read (dates and amounts) and your credit risk reasoning.
 
-Return ONLY a JSON object with exactly these keys:
+Return ONLY a valid JSON object — no markdown, no preamble, no chain-of-thought — with exactly these keys:
 {
   "risk_score": <number 0-100>,
   "risk_category": "low" | "medium" | "high",
   "explanation": "<string>"
 }
-No markdown, no preamble, no extra keys.
+Your ENTIRE response must be this JSON object and nothing else.
 """
 
 
@@ -243,7 +243,7 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
     """
     from google.adk.agents import LlmAgent
     from google.adk.runners import InMemoryRunner
-    from google.genai.types import Content, Part
+    from google.genai.types import Content, Part, GenerateContentConfig
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -257,6 +257,11 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
         model="gemini-3.5-flash",
         description="Senior credit risk analyst for microfinance escalated cases.",
         instruction=_AGENT_SYSTEM_PROMPT,
+        generate_content_config=GenerateContentConfig(
+            temperature=0.2,               # low temp = consistent, fact-grounded scores
+            max_output_tokens=1024,
+            response_mime_type="application/json",  # no preamble, pure JSON only
+        ),
     )
 
     runner = InMemoryRunner(agent=agent, app_name="setu")
@@ -308,7 +313,7 @@ def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
     """
     from google.adk.agents import LlmAgent
     from google.adk.runners import InMemoryRunner
-    from google.genai.types import Content, Part
+    from google.genai.types import Content, Part, GenerateContentConfig
 
     if not req.image_data_base64:
         raise ValueError("Missing image_data_base64 in request for vision assessment")
@@ -327,6 +332,14 @@ def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
         model="gemini-3.5-flash",
         description="Senior credit risk analyst specializing in handwritten ledger vision OCR and underwriting.",
         instruction=_VISION_AGENT_SYSTEM_PROMPT,
+        generate_content_config=GenerateContentConfig(
+            temperature=0.2,               # low temp = grounded in image facts, not heuristic defaults
+            max_output_tokens=2048,
+            # NOTE: response_mime_type="application/json" is intentionally omitted here.
+            # JSON output mode is incompatible with multimodal (image) inputs on this API
+            # configuration — it causes truncated output. The vision prompt + _parse_gemini_json
+            # handles extraction robustly without it.
+        ),
     )
 
     runner = InMemoryRunner(agent=agent, app_name="setu_vision")
