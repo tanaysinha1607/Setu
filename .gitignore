@@ -18,3 +18,5 @@ llama-bin/
 # Ignore local debug/scratch scripts
 debug_sms.py
 debug_server.py
+
+__pycache__
