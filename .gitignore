@@ -20,3 +20,4 @@ debug_sms.py
 debug_server.py
 
 __pycache__
+*.png
