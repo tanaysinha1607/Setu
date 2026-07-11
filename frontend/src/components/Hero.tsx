@@ -61,12 +61,11 @@ export default function Hero() {
         </motion.div>
       </Suspense>
 
-      {/* Text content */}
       <motion.div
         initial={{ opacity: 0, y: 30 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.8, delay: 0.3 }}
-        style={{ textAlign: 'center', maxWidth: '600px', marginTop: '-2rem' }}
+        style={{ textAlign: 'center', maxWidth: '600px', marginTop: '-2rem', position: 'relative', zIndex: 10 }}
       >
         <h1
           className="font-display"
