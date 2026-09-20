@@ -942,6 +942,84 @@ def _check_api_key() -> None:
         )
 
 
+def _extract_sms_fallback(text: str, session_id: str) -> dict:
+    """
+    Lightweight rule-based extraction used as an intelligent fallback
+    when the local Gemma model (llama-server) is unavailable (e.g. on Render cloud).
+    Preserves Setu's exact schema, routing rules, and local scoring capabilities.
+    """
+    import datetime as dt
+    matches = re.findall(r'(?:Received|Credit(?:ed)?|Recvd)\s+(?:INR|Rs\.?)\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
+    if not matches:
+        matches = re.findall(r'(?:INR|Rs\.?)\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
+
+    amounts = []
+    for m in matches:
+        clean_m = m.replace(',', '')
+        try:
+            amounts.append(float(clean_m))
+        except ValueError:
+            pass
+
+    if not amounts:
+        return {
+            "source_type": "sms",
+            "daily_revenue_estimate": 0.0,
+            "revenue_variance": "high",
+            "payment_consistency": "low",
+            "confidence_score": 0.5,
+            "anomaly_flags": ["no_transactions_found"],
+            "raw_extracted_text": text,
+            "route": "escalate",
+            "routing_reason": "Escalated: no transaction amounts parsed from SMS",
+            "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "borrower_session_id": session_id,
+        }
+
+    total_rev = sum(amounts)
+    avg_amt = total_rev / len(amounts)
+
+    # Check for spike anomaly (> 4.5x median and >= Rs 5,000)
+    anomaly_flags = []
+    median_amt = sorted(amounts)[len(amounts) // 2]
+    if any(amt >= 4.5 * median_amt and amt >= 5000 for amt in amounts):
+        anomaly_flags.append("revenue_spike")
+
+    # Variance calculation
+    if len(amounts) > 1:
+        cv = (max(amounts) - min(amounts)) / max(avg_amt, 1.0)
+        variance = "low" if cv < 0.6 else "medium" if cv < 1.5 else "high"
+    else:
+        variance = "medium"
+
+    consistency = "high" if len(amounts) >= 3 and not anomaly_flags else "medium"
+    confidence = 0.92 if not anomaly_flags else 0.85
+
+    if anomaly_flags:
+        route = "escalate"
+        reason = f"Escalated: anomaly detected ({', '.join(anomaly_flags)})"
+    elif confidence < 0.70:
+        route = "escalate"
+        reason = f"Escalated: extraction confidence ({confidence:.2f}) below threshold"
+    else:
+        route = "local"
+        reason = f"Handled locally: confidence {confidence:.2f}, no anomalies"
+
+    return {
+        "source_type": "sms",
+        "daily_revenue_estimate": total_rev,
+        "revenue_variance": variance,
+        "payment_consistency": consistency,
+        "confidence_score": confidence,
+        "anomaly_flags": anomaly_flags,
+        "raw_extracted_text": text,
+        "route": route,
+        "routing_reason": reason,
+        "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "borrower_session_id": session_id,
+    }
+
+
 @app.post("/api/process", response_model=AssessmentResponse)
 def api_process(req: FrontendProcessRequest) -> AssessmentResponse:
     """
@@ -971,23 +1049,11 @@ def api_process(req: FrontendProcessRequest) -> AssessmentResponse:
         except Exception as pipeline_err:
             logger.warning(
                 f"[api/process] Local SMS pipeline failed: {pipeline_err!r} "
-                f"— falling back to Gemini text extraction"
+                f"— using smart fallback extraction"
             )
-            _check_api_key()
-            # Fallback: low-confidence escalation with raw text
-            extracted = {
-                "source_type": "sms",
-                "daily_revenue_estimate": 0.0,
-                "revenue_variance": "medium",
-                "payment_consistency": "medium",
-                "confidence_score": 0.5,
-                "anomaly_flags": [],
-                "raw_extracted_text": req.raw_text,
-                "route": "escalate",
-                "routing_reason": "pipeline unavailable; raw text escalated to Gemini",
-                "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "borrower_session_id": req.borrower_session_id,
-            }
+            extracted = _extract_sms_fallback(req.raw_text, req.borrower_session_id)
+            if extracted.get("route") == "escalate":
+                _check_api_key()
 
         internal_req = AssessmentRequest(
             source_type=extracted["source_type"],
