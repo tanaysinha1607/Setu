@@ -3,7 +3,8 @@
 // ---------------------------------------------------------------------------
 // Single place to change the backend URL and endpoint path.
 
-export const API_BASE_URL = 'http://localhost:8000';
+export const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 export const PROCESS_ENDPOINT = '/api/process';
 
 // Mock mode: reads VITE_MOCK_MODE env var.
