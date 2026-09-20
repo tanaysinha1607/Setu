@@ -214,4 +214,4 @@ When processing credit risk records:
 
 ## 🤝 Acknowledgments
 
-Developed during the **Google DeepMind Bangalore Hackathon 2026**. Designed to bridge the digital gap in microfinance underwriting.
+Developed during the Google DeepMind Bangalore Hackathon 2026. Designed to bridge the digital gap in microfinance underwriting.
