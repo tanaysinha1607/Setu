@@ -64,7 +64,7 @@ USER_MSG = (
 print("Creating LlmAgent...", flush=True)
 agent = LlmAgent(
     name="setu_credit_risk_analyst",
-    model="gemini-3.5-flash",
+    model="gemini-3.5-flash-lite",
     instruction=SYSTEM_PROMPT,
     description="Senior credit risk analyst for microfinance escalated cases.",
 )

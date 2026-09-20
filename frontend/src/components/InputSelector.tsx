@@ -158,7 +158,6 @@ export default function InputSelector() {
   const [audioBase64, setAudioBase64] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
-  const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
   const audioInputRef = useRef<HTMLInputElement>(null);
 
   const handleSmsSubmit = () => {
@@ -249,7 +248,6 @@ export default function InputSelector() {
       };
       mr.start();
       setMediaRecorder(mr);
-      setRecordedChunks(chunks);
       setIsRecording(true);
     } catch (err) {
       console.warn('Microphone access denied:', err);

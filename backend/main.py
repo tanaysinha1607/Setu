@@ -29,11 +29,14 @@ from pydantic import BaseModel, Field, field_validator
 try:
     from dotenv import load_dotenv
     _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-    load_dotenv(dotenv_path=_env_path)
+    load_dotenv(dotenv_path=_env_path, override=True)
 except ImportError:
     pass  # python-dotenv not installed; rely on OS env vars
 
 logger = logging.getLogger("setu")
+
+# Active cloud Gemini model for escalated cases
+CLOUD_MODEL = os.environ.get("SETU_CLOUD_MODEL", "gemini-3.5-flash-lite")
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -311,7 +314,7 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
 
     agent = LlmAgent(
         name="setu_credit_risk_analyst",
-        model="gemini-3.5-flash",
+        model=CLOUD_MODEL,
         description="Senior credit risk analyst for microfinance escalated cases.",
         instruction=_AGENT_SYSTEM_PROMPT,
         generate_content_config=GenerateContentConfig(
@@ -344,7 +347,7 @@ def _call_adk_agent(req: AssessmentRequest) -> tuple[dict, str]:
                     final_text += part.text
 
     parsed = _parse_gemini_json(final_text)
-    return parsed, "google-adk Managed Agent (iAPI, LlmAgent, gemini-3.5-flash)"
+    return parsed, f"google-adk Managed Agent (iAPI, LlmAgent, {CLOUD_MODEL})"
 
 
 def _parse_base64_image(data_url: str) -> tuple[bytes, str]:
@@ -387,7 +390,7 @@ def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
 
     agent = LlmAgent(
         name="setu_ledger_vision_analyst",
-        model="gemini-3.5-flash",
+        model=CLOUD_MODEL,
         description="Senior credit risk analyst specializing in handwritten ledger vision OCR and underwriting.",
         instruction=_VISION_AGENT_SYSTEM_PROMPT,
         generate_content_config=GenerateContentConfig(
@@ -428,7 +431,43 @@ def _call_adk_vision_agent(req: AssessmentRequest) -> tuple[dict, str]:
                     final_text += part.text
 
     parsed = _parse_gemini_json(final_text)
-    return parsed, "google-adk Managed Agent (iAPI, Vision LlmAgent, gemini-3.5-flash)"
+    return parsed, f"google-adk Managed Agent (iAPI, Vision LlmAgent, {CLOUD_MODEL})"
+
+
+def _call_genai_direct_vision(req: AssessmentRequest) -> tuple[dict, str]:
+    """
+    Direct google-genai SDK fallback for ledger photo vision underwriting.
+    """
+    import google.genai as genai
+    from google.genai import types as genai_types
+
+    if not req.image_data_base64:
+        raise ValueError("Missing image_data_base64 in request for vision assessment")
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+    client = genai.Client(api_key=api_key)
+    img_bytes, mime_type = _parse_base64_image(req.image_data_base64)
+    part = genai_types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+    text_prompt = (
+        f"Please analyze this ledger photo for borrower session {req.borrower_session_id}.\n"
+        f"Routing reason: {req.routing_reason}"
+    )
+
+    response = client.models.generate_content(
+        model=CLOUD_MODEL,
+        contents=[part, text_prompt],
+        config=genai_types.GenerateContentConfig(
+            system_instruction=_VISION_AGENT_SYSTEM_PROMPT,
+            temperature=0.2,
+            max_output_tokens=4096,
+        ),
+    )
+    raw_text = response.text or ""
+    parsed = _parse_gemini_json(raw_text)
+    return parsed, f"google-genai v2 SDK (Vision direct GenerativeContent, {CLOUD_MODEL})"
 
 
 _AUDIO_AGENT_SYSTEM_PROMPT = """\
@@ -505,7 +544,7 @@ def _call_adk_audio_agent(req: AssessmentRequest) -> tuple[dict, str]:
 
     agent = LlmAgent(
         name="setu_audio_voice_analyst",
-        model="gemini-3.5-flash",
+        model=CLOUD_MODEL,
         description="Senior credit risk analyst specializing in voice note transcription and microfinance underwriting.",
         instruction=_AUDIO_AGENT_SYSTEM_PROMPT,
         generate_content_config=GenerateContentConfig(
@@ -544,8 +583,43 @@ def _call_adk_audio_agent(req: AssessmentRequest) -> tuple[dict, str]:
                     final_text += part.text
 
     parsed = _parse_gemini_json(final_text)
-    return parsed, "google-adk Managed Agent (iAPI, Audio LlmAgent, gemini-3.5-flash)"
+    return parsed, f"google-adk Managed Agent (iAPI, Audio LlmAgent, {CLOUD_MODEL})"
 
+
+def _call_genai_direct_audio(req: AssessmentRequest) -> tuple[dict, str]:
+    """
+    Direct google-genai SDK fallback for voice note audio transcription & underwriting.
+    """
+    import google.genai as genai
+    from google.genai import types as genai_types
+
+    if not req.audio_data_base64:
+        raise ValueError("Missing audio_data_base64 in request for audio assessment")
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+    client = genai.Client(api_key=api_key)
+    audio_bytes, mime_type = _parse_base64_audio(req.audio_data_base64)
+    part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    text_prompt = (
+        f"Please analyze this voice note for borrower session {req.borrower_session_id}.\n"
+        f"Routing reason: {req.routing_reason}"
+    )
+
+    response = client.models.generate_content(
+        model=CLOUD_MODEL,
+        contents=[part, text_prompt],
+        config=genai_types.GenerateContentConfig(
+            system_instruction=_AUDIO_AGENT_SYSTEM_PROMPT,
+            temperature=0.2,
+            max_output_tokens=2048,
+        ),
+    )
+    raw_text = response.text or ""
+    parsed = _parse_gemini_json(raw_text)
+    return parsed, f"google-genai v2 SDK (Audio direct GenerativeContent, {CLOUD_MODEL})"
 
 
 def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
@@ -566,7 +640,7 @@ def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
     user_msg = _build_agent_user_message(req)
 
     response = client.models.generate_content(
-        model="gemini-3.5-flash",
+        model=CLOUD_MODEL,
         contents=user_msg,
         config=genai_types.GenerateContentConfig(
             system_instruction=_AGENT_SYSTEM_PROMPT,
@@ -581,8 +655,8 @@ def _call_genai_direct(req: AssessmentRequest) -> tuple[dict, str]:
     raw_text = response.text or ""
     parsed = _parse_gemini_json(raw_text)
     return parsed, (
-        "google-genai v2 SDK (google.genai.Client, direct GenerativeContent call, "
-        "gemini-3.5-flash, agent-style system_instruction)"
+        f"google-genai v2 SDK (google.genai.Client, direct GenerativeContent call, "
+        f"{CLOUD_MODEL}, agent-style system_instruction)"
     )
 
 
@@ -714,32 +788,30 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
     escalation_method: str | None = None
 
     # ── Voice note guard / Audio path ────────────────────────────────────────
-    # If a voice note is sent with base64 audio data, run our ADK audio analyst.
-    # If the audio call fails or no audio data was supplied, fall back to the
-    # honest pending_review stub.
     if req.source_type == "voice_note":
         if req.audio_data_base64 and req.audio_data_base64.strip():
-            try:
-                parsed, method = _call_adk_audio_agent(req)
-                risk_score = float(parsed["risk_score"])
-                risk_score = max(0.0, min(100.0, round(risk_score, 2)))
-                risk_category = str(parsed.get("risk_category", "")).lower()
-                if risk_category not in ("low", "medium", "high"):
-                    risk_category = _categorise(risk_score)
-                explanation = str(parsed["explanation"])
-                latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
+            for attempt_fn in [_call_adk_audio_agent, _call_genai_direct_audio]:
+                try:
+                    parsed, method = attempt_fn(req)
+                    risk_score = float(parsed["risk_score"])
+                    risk_score = max(0.0, min(100.0, round(risk_score, 2)))
+                    risk_category = str(parsed.get("risk_category", "")).lower()
+                    if risk_category not in ("low", "medium", "high"):
+                        risk_category = _categorise(risk_score)
+                    explanation = str(parsed["explanation"])
+                    latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
 
-                return AssessmentResponse(
-                    risk_score=risk_score,
-                    risk_category=risk_category,
-                    explanation=explanation,
-                    route="escalate",
-                    routing_reason=req.routing_reason,
-                    latency_ms=latency_ms,
-                    escalation_method=method,
-                )
-            except Exception as e:
-                logger.warning(f"[assess] Audio escalation failed: {e!r}. Falling back to pending review stub.")
+                    return AssessmentResponse(
+                        risk_score=risk_score,
+                        risk_category=risk_category,
+                        explanation=explanation,
+                        route="escalate",
+                        routing_reason=req.routing_reason,
+                        latency_ms=latency_ms,
+                        escalation_method=method,
+                    )
+                except Exception as e:
+                    logger.warning(f"[assess] Audio escalation attempt {attempt_fn.__name__} failed: {e!r}")
 
         # Fallback pending review stub
         latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
@@ -759,44 +831,42 @@ def assess(req: AssessmentRequest) -> AssessmentResponse:
     # ── End voice note guard ─────────────────────────────────────────────────
 
     # ── Ledger photo guard / Vision path ─────────────────────────────────────
-    # If a ledger photo is sent with base64 image data, run our ADK vision analyst.
-    # If the vision call fails or if no image data was supplied, fall back to the
-    # honest pending_review stub.
     if req.source_type == "ledger_photo":
         if req.image_data_base64 and req.image_data_base64.strip():
-            try:
-                parsed, method = _call_adk_vision_agent(req)
-                risk_score = float(parsed["risk_score"])
-                risk_score = max(0.0, min(100.0, round(risk_score, 2)))
-                risk_category = str(parsed.get("risk_category", "")).lower()
-                if risk_category not in ("low", "medium", "high"):
-                    risk_category = _categorise(risk_score)
-                explanation = str(parsed["explanation"])
+            for attempt_fn in [_call_adk_vision_agent, _call_genai_direct_vision]:
+                try:
+                    parsed, method = attempt_fn(req)
+                    risk_score = float(parsed["risk_score"])
+                    risk_score = max(0.0, min(100.0, round(risk_score, 2)))
+                    risk_category = str(parsed.get("risk_category", "")).lower()
+                    if risk_category not in ("low", "medium", "high"):
+                        risk_category = _categorise(risk_score)
+                    explanation = str(parsed["explanation"])
 
-                # Extract confidence and flags from vision JSON, post-process explanation
-                raw_conf = parsed.get("confidence_score")
-                vis_confidence = min(1.0, max(0.0, float(raw_conf))) if raw_conf is not None else None
+                    # Extract confidence and flags from vision JSON, post-process explanation
+                    raw_conf = parsed.get("confidence_score")
+                    vis_confidence = min(1.0, max(0.0, float(raw_conf))) if raw_conf is not None else None
 
-                vis_flags_raw = parsed.get("anomaly_flags", [])
-                vis_flags = [str(f) for f in vis_flags_raw] if isinstance(vis_flags_raw, list) else []
-                vis_flags = _extract_flags_from_explanation(explanation, vis_flags)
+                    vis_flags_raw = parsed.get("anomaly_flags", [])
+                    vis_flags = [str(f) for f in vis_flags_raw] if isinstance(vis_flags_raw, list) else []
+                    vis_flags = _extract_flags_from_explanation(explanation, vis_flags)
 
-                latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
+                    latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
 
-                return AssessmentResponse(
-                    risk_score=risk_score,
-                    risk_category=risk_category,
-                    explanation=explanation,
-                    route="escalate",
-                    routing_reason=req.routing_reason,
-                    latency_ms=latency_ms,
-                    escalation_method=method,
-                    confidence_score=vis_confidence,
-                    anomaly_flags=vis_flags,
-                )
-            except Exception as e:
-                logger.warning(f"[assess] Vision escalation failed: {e!r}. Falling back to pending review stub.")
-        
+                    return AssessmentResponse(
+                        risk_score=risk_score,
+                        risk_category=risk_category,
+                        explanation=explanation,
+                        route="escalate",
+                        routing_reason=req.routing_reason,
+                        latency_ms=latency_ms,
+                        escalation_method=method,
+                        confidence_score=vis_confidence,
+                        anomaly_flags=vis_flags,
+                    )
+                except Exception as e:
+                    logger.warning(f"[assess] Vision escalation attempt {attempt_fn.__name__} failed: {e!r}")
+
         # Fallback pending review stub
         latency_ms = round((time.perf_counter() - t_start) * 1000, 3)
         return AssessmentResponse(
